@@ -72,7 +72,7 @@ async function escalateCall(incidentId, tierIndex = 0) {
   }
 }
 
-app.post("/twilio/voice", (req, res) => {
+app.all("/twilio/voice", (req, res) => {
   const { incidentId, tier } = req.query;
   const incident = activeIncidents[incidentId];
   const tierName = `Tier ${parseInt(tier) + 1}`;
@@ -84,7 +84,7 @@ app.post("/twilio/voice", (req, res) => {
   res.type("text/xml");
   res.send(`
     <Response>
-      <Gather numDigits="1" action="${RAILWAY_URL}/twilio/gather?incidentId=${incidentId}&tier=${tier}" timeout="10">
+      <Gather numDigits="1" action="${RAILWAY_URL}/twilio/gather?incidentId=${incidentId}&tier=${tier}" method="POST" timeout="10">
         <Say voice="alice" language="en-US">
           Alert. New incident reported.
           Severity: ${severity}.
@@ -99,9 +99,9 @@ app.post("/twilio/voice", (req, res) => {
   `);
 });
 
-app.post("/twilio/gather", async (req, res) => {
+app.all("/twilio/gather", async (req, res) => {
   const { incidentId, tier } = req.query;
-  const digit = req.body.Digits;
+  const digit = req.body?.Digits || req.query?.Digits;
   const incident = activeIncidents[incidentId];
 
   if (digit === "1" && incident) {
