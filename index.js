@@ -3,20 +3,17 @@ import bodyParser from "body-parser";
 import axios from "axios";
 
 const app = express();
-
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
-
 if (!SLACK_BOT_TOKEN) {
   console.error("SLACK_BOT_TOKEN nije postavljen!");
 }
 
 // Slash command
 app.post("/slack/command", async (req, res) => {
-  const { trigger_id } = req.body;
-
+  const { trigger_id, channel_id } = req.body;
   res.status(200).send();
 
   try {
@@ -27,6 +24,7 @@ app.post("/slack/command", async (req, res) => {
         view: {
           type: "modal",
           callback_id: "incident_modal",
+          private_metadata: channel_id,
           title: { type: "plain_text", text: "New Incident" },
           submit: { type: "plain_text", text: "Submit" },
           close: { type: "plain_text", text: "Cancel" },
@@ -39,9 +37,9 @@ app.post("/slack/command", async (req, res) => {
                 type: "static_select",
                 action_id: "severity_action",
                 options: [
-                  { text: { type: "plain_text", text: "P1" }, value: "P1" },
-                  { text: { type: "plain_text", text: "P2" }, value: "P2" },
-                  { text: { type: "plain_text", text: "P3" }, value: "P3" }
+                  { text: { type: "plain_text", text: "P1 - Critical" }, value: "P1" },
+                  { text: { type: "plain_text", text: "P2 - High" }, value: "P2" },
+                  { text: { type: "plain_text", text: "P3 - Medium" }, value: "P3" }
                 ]
               }
             },
@@ -85,29 +83,38 @@ app.post("/slack/command", async (req, res) => {
 });
 
 // Modal submit
-app.post("/slack/interactions", (req, res) => {
+app.post("/slack/interactions", async (req, res) => {
   const payload = JSON.parse(req.body.payload);
 
   if (payload.type === "view_submission") {
     const values = payload.view.state.values;
+    const severity = values.severity_block.severity_action.selected_option.value;
+    const type = values.type_block.type_action.selected_option.value;
+    const description = values.desc_block.desc_action.value;
+    const user = payload.user.name;
+    const channel = payload.view.private_metadata;
 
-    const severity =
-      values.severity_block.severity_action.selected_option.value;
+    res.json({ response_action: "clear" });
 
-    const type =
-      values.type_block.type_action.selected_option.value;
+    try {
+      await axios.post(
+        "https://slack.com/api/chat.postMessage",
+        {
+          channel: channel || "#inc-client-test",
+          text: `🚨 *New Incident*\n*Severity:* ${severity}\n*Type:* ${type}\n*Reported by:* @${user}\n*Description:* ${description}`
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+            "Content-Type": "application/json"
+          }
+        }
+      );
+    } catch (err) {
+      console.error("Error posting to Slack:", err.response?.data || err.message);
+    }
 
-    const description =
-      values.desc_block.desc_action.value;
-
-    console.log("🚨 INCIDENT RECEIVED:");
-    console.log("Severity:", severity);
-    console.log("Type:", type);
-    console.log("Description:", description);
-
-    return res.json({
-      response_action: "clear"
-    });
+    return;
   }
 
   res.status(200).send();
@@ -118,8 +125,7 @@ app.get("/", (req, res) => {
   res.status(200).send("Server is healthy ✅");
 });
 
-const port = process.env.PORT || 8080;
-
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
 });
