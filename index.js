@@ -1,27 +1,22 @@
-const express = require("express");
-const bodyParser = require("body-parser");
-const axios = require("axios");
+import express from "express";
+import bodyParser from "body-parser";
+import axios from "axios";
 
 const app = express();
 
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
-// Slack Bot Token iz Railway Environment Variables
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 
 if (!SLACK_BOT_TOKEN) {
-  console.error("SLACK_BOT_TOKEN nije postavljen u env variables!");
+  console.error("SLACK_BOT_TOKEN nije postavljen!");
 }
 
-// ----------------------------
 // Slash command
-// ----------------------------
-
 app.post("/slack/command", async (req, res) => {
   const { trigger_id } = req.body;
 
-  // Slack mora dobiti odgovor za <3s
   res.status(200).send();
 
   try {
@@ -89,10 +84,7 @@ app.post("/slack/command", async (req, res) => {
   }
 });
 
-// ----------------------------
-// Modal submit handler
-// ----------------------------
-
+// Modal submit
 app.post("/slack/interactions", (req, res) => {
   const payload = JSON.parse(req.body.payload);
 
@@ -121,10 +113,7 @@ app.post("/slack/interactions", (req, res) => {
   res.status(200).send();
 });
 
-// ----------------------------
 // Health check
-// ----------------------------
-
 app.get("/", (req, res) => {
   res.status(200).send("Server is healthy ✅");
 });
