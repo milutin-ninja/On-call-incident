@@ -31,12 +31,18 @@ async function escalateCall(incidentId, tierIndex = 0) {
   }
 
   const incident = activeIncidents[incidentId];
-  if (!incident) return;
+  if (!incident) {
+    console.error(`❌ Incident ${incidentId} nije pronađen u memoriji!`);
+    return;
+  }
 
   const toNumber = ON_CALL_NUMBERS[tierIndex];
   const tierName = `Tier ${tierIndex + 1}`;
 
-  console.log(`📞 Incident ${incidentId}: Pozivam ${tierName}: ${toNumber}`);
+  console.log(`📞 Pokušavam poziv: ${tierName} → ${toNumber}`);
+  console.log(`📋 Twilio FROM: ${TWILIO_FROM_NUMBER}`);
+  console.log(`📋 Twilio SID: ${TWILIO_ACCOUNT_SID}`);
+  console.log(`📋 Railway URL: ${RAILWAY_URL}`);
 
   try {
     const call = await twilioClient.calls.create({
@@ -60,7 +66,8 @@ async function escalateCall(incidentId, tierIndex = 0) {
     }, 120000);
 
   } catch (err) {
-    console.error(`Error calling ${tierName}:`, err.message);
+    console.error(`❌ Twilio greška za ${tierName}:`, err.message);
+    console.error(`❌ Twilio detalji:`, err.code, err.status);
     escalateCall(incidentId, tierIndex + 1);
   }
 }
