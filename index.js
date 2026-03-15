@@ -81,22 +81,10 @@ app.all("/twilio/voice", (req, res) => {
   const type = incident?.type || "Unknown";
   const description = incident?.description || "No description";
 
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Gather numDigits="1" action="${RAILWAY_URL}/twilio/gather?incidentId=${incidentId}&amp;tier=${tier}" method="POST" timeout="10"><Say voice="alice" language="en-US">Alert. New incident reported. Severity ${severity}. Type ${type}. Description ${description}. This is ${tierName} escalation. Press 1 to acknowledge and take ownership of this incident.</Say></Gather><Say voice="alice">No input received. Escalating to next tier.</Say></Response>`;
+
   res.type("text/xml");
-  res.send(`
-    <Response>
-      <Gather numDigits="1" action="${RAILWAY_URL}/twilio/gather?incidentId=${incidentId}&tier=${tier}" method="POST" timeout="10">
-        <Say voice="alice" language="en-US">
-          Alert. New incident reported.
-          Severity: ${severity}.
-          Type: ${type}.
-          Description: ${description}.
-          This is ${tierName} escalation.
-          Press 1 to acknowledge and take ownership of this incident.
-        </Say>
-      </Gather>
-      <Say voice="alice">No input received. Escalating to next tier.</Say>
-    </Response>
-  `);
+  res.send(twiml);
 });
 
 app.all("/twilio/gather", async (req, res) => {
@@ -128,19 +116,14 @@ app.all("/twilio/gather", async (req, res) => {
       console.error("Error posting to Slack:", err.message);
     }
 
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">Thank you. You have acknowledged the incident. Please check Slack for details. Good luck.</Say></Response>`;
     res.type("text/xml");
-    res.send(`
-      <Response>
-        <Say voice="alice">Thank you. You have acknowledged the incident. Please check Slack for details. Good luck.</Say>
-      </Response>
-    `);
+    res.send(twiml);
+
   } else {
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">Invalid input. Escalating to next tier.</Say></Response>`;
     res.type("text/xml");
-    res.send(`
-      <Response>
-        <Say voice="alice">Invalid input. Escalating to next tier.</Say>
-      </Response>
-    `);
+    res.send(twiml);
     escalateCall(incidentId, parseInt(tier) + 1);
   }
 });
