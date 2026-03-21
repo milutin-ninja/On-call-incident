@@ -13,6 +13,7 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
 const RAILWAY_URL = process.env.RAILWAY_URL;
 const CLICKUP_API_KEY = process.env.CLICKUP_API_KEY;
+const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
 const CLICKUP_PHONE_DOC_ID = "8cn80zu-52054";
 const CLICKUP_PHONE_PAGE_ID = "8cn80zu-65534";
 
@@ -98,17 +99,14 @@ async function buildEscalationChain(channelId) {
 
   const { phoneMap, folderMap, nameMap } = await getPhoneDirectory();
 
-  // Tier 1 — Developer iz Phone Directory po folder ID-u
   const developer = folderMap[folderId];
   console.log(`👤 Developer for folder ${folderId}:`, developer);
 
-  // Space ime za Team Lead lookup
   const spaceName = await getSpaceNameForFolder(folderId);
   console.log("🏢 Space:", spaceName);
 
   const teamLead = spaceName ? TEAM_LEADS[spaceName] : null;
   const cto = CTO;
-
   const chain = [];
 
   // Tier 1 — Developer
@@ -116,6 +114,7 @@ async function buildEscalationChain(channelId) {
     chain.push({
       name: developer.name,
       phone: developer.phone,
+      clickupId: developer.clickupId,
       tier: 1,
     });
   }
@@ -127,6 +126,7 @@ async function buildEscalationChain(channelId) {
     chain.push({
       name: name || teamLead.name,
       phone: phone || null,
+      clickupId: teamLead.clickupId || null,
       tier: 2,
     });
   }
@@ -137,11 +137,12 @@ async function buildEscalationChain(channelId) {
   chain.push({
     name: ctoName || cto.name,
     phone: ctoPhone || null,
+    clickupId: cto.clickupId || null,
     tier: 3,
   });
 
   console.log("✅ Final escalation chain:", JSON.stringify(chain));
-  return chain;
+  return { chain, folderId };
 }
 
 async function escalateCall(incidentId, tierIndex = 0) {
@@ -224,8 +225,24 @@ app.all("/twilio/gather", async (req, res) => {
     incident.acknowledged = true;
     clearTimeout(incident.escalationTimer);
 
-    console.log(`✅ Incident ${incidentId}: ${person?.name || "Tier " + (parseInt(tier) + 1)} acknowledged!`);
+    console.log(`✅ Incident ${incidentId}: ${person?.name} acknowledged!`);
 
+    // Šalji webhook na Make
+    if (MAKE_WEBHOOK_URL) {
+      try {
+        await axios.post(MAKE_WEBHOOK_URL, {
+          incident_id: incidentId,
+          list_id: incident.listId,
+          description: incident.description,
+          assignee_clickup_id: person?.clickupId || null,
+        });
+        console.log(`✅ Make webhook sent for incident ${incidentId}`);
+      } catch (err) {
+        console.error("❌ Error sending Make webhook:", err.message);
+      }
+    }
+
+    // Slack poruka
     try {
       await axios.post(
         "https://slack.com/api/chat.postMessage",
@@ -357,7 +374,7 @@ app.post("/slack/interactions", async (req, res) => {
     const channel = payload.view.private_metadata;
 
     const incidentId = `INC-${Date.now()}`;
-    const escalationChain = await buildEscalationChain(channel);
+    const result = await buildEscalationChain(channel);
 
     activeIncidents[incidentId] = {
       id: incidentId,
@@ -367,7 +384,9 @@ app.post("/slack/interactions", async (req, res) => {
       user,
       channel,
       acknowledged: false,
-      escalationChain,
+      escalationChain: result?.chain || null,
+      listId: "901414563380",
+      folderId: result?.folderId || null,
       createdAt: new Date().toISOString(),
     };
 
@@ -391,7 +410,7 @@ app.post("/slack/interactions", async (req, res) => {
       console.error("Error posting to Slack:", err.response?.data || err.message);
     }
 
-    if (escalationChain && escalationChain.length > 0) {
+    if (result?.chain && result.chain.length > 0) {
       escalateCall(incidentId, 0);
     } else {
       console.error(`❌ Incident ${incidentId}: No escalation chain for channel ${channel}`);
