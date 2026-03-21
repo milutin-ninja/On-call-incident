@@ -16,7 +16,6 @@ const CLICKUP_API_KEY = process.env.CLICKUP_API_KEY;
 const CLICKUP_PHONE_DOC_ID = "8cn80zu-52054";
 const CLICKUP_PHONE_PAGE_ID = "8cn80zu-65534";
 
-// Team Lead mapping po Space-u
 const TEAM_LEADS = {
   "NPD Team": { name: "Andrija Djuric", clickupId: "42457090" },
   "New Cookies Team": { name: "Filip Nicic", clickupId: null },
@@ -24,13 +23,11 @@ const TEAM_LEADS = {
   "Test Team": { name: "Nemanja Vasilevski", clickupId: null },
 };
 
-// CTO je uvek Tier 3
 const CTO = { name: "Stefan Mikic", clickupId: "42457093" };
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const activeIncidents = {};
 
-// Čita Phone Directory iz ClickUp dokumenta
 async function getPhoneDirectory() {
   try {
     const response = await axios.get(
@@ -40,33 +37,36 @@ async function getPhoneDirectory() {
     const content = response.data.content;
     const phoneMap = {};
     const folderMap = {};
+    const nameMap = {};
 
     const rows = content.split("\n").filter(row => row.startsWith("|") && !row.includes("---") && !row.includes("Profil"));
     for (const row of rows) {
       const cells = row.split("|").map(c => c.trim()).filter(Boolean);
       if (cells.length >= 3) {
         const profileCell = cells[0];
+        const fullName = cells[1];
         const phone = cells[2];
         const folderIds = cells[3] ? cells[3].split(",").map(id => id.trim()).filter(Boolean) : [];
         const match = profileCell.match(/user_mention#(\d+)/);
         if (match) {
-          phoneMap[match[1]] = phone;
+          const clickupId = match[1];
+          phoneMap[clickupId] = phone;
+          nameMap[clickupId] = fullName;
           for (const folderId of folderIds) {
-            folderMap[folderId] = { clickupId: match[1], phone };
+            folderMap[folderId] = { clickupId, phone, name: fullName };
           }
         }
       }
     }
     console.log("📋 Phone Directory loaded:", phoneMap);
     console.log("📋 Folder Map loaded:", folderMap);
-    return { phoneMap, folderMap };
+    return { phoneMap, folderMap, nameMap };
   } catch (err) {
     console.error("❌ Error reading Phone Directory:", err.message);
-    return { phoneMap: {}, folderMap: {} };
+    return { phoneMap: {}, folderMap: {}, nameMap: {} };
   }
 }
 
-// Pronađi space ime na osnovu folder ID-a
 async function getSpaceNameForFolder(folderId) {
   try {
     const response = await axios.get(
@@ -80,7 +80,6 @@ async function getSpaceNameForFolder(folderId) {
   }
 }
 
-// Gradi eskalacioni lanac na osnovu channel ID-a
 async function buildEscalationChain(channelId) {
   console.log(`🔍 Building escalation chain for channel: ${channelId}`);
   console.log(`🔍 All env vars with SLACK_CHANNEL:`, Object.keys(process.env).filter(k => k.startsWith("SLACK_CHANNEL_")));
@@ -97,7 +96,7 @@ async function buildEscalationChain(channelId) {
     return null;
   }
 
-  const { phoneMap, folderMap } = await getPhoneDirectory();
+  const { phoneMap, folderMap, nameMap } = await getPhoneDirectory();
 
   // Tier 1 — Developer iz Phone Directory po folder ID-u
   const developer = folderMap[folderId];
@@ -115,7 +114,7 @@ async function buildEscalationChain(channelId) {
   // Tier 1 — Developer
   if (developer) {
     chain.push({
-      name: developer.clickupId,
+      name: developer.name,
       phone: developer.phone,
       tier: 1,
     });
@@ -124,8 +123,9 @@ async function buildEscalationChain(channelId) {
   // Tier 2 — Team Lead
   if (teamLead) {
     const phone = teamLead.clickupId ? phoneMap[teamLead.clickupId] : null;
+    const name = teamLead.clickupId ? nameMap[teamLead.clickupId] : teamLead.name;
     chain.push({
-      name: teamLead.name,
+      name: name || teamLead.name,
       phone: phone || null,
       tier: 2,
     });
@@ -133,8 +133,9 @@ async function buildEscalationChain(channelId) {
 
   // Tier 3 — CTO
   const ctoPhone = cto.clickupId ? phoneMap[cto.clickupId] : null;
+  const ctoName = cto.clickupId ? nameMap[cto.clickupId] : cto.name;
   chain.push({
-    name: cto.name,
+    name: ctoName || cto.name,
     phone: ctoPhone || null,
     tier: 3,
   });
@@ -143,7 +144,6 @@ async function buildEscalationChain(channelId) {
   return chain;
 }
 
-// Eskalacija
 async function escalateCall(incidentId, tierIndex = 0) {
   const incident = activeIncidents[incidentId];
   if (!incident) {
@@ -231,7 +231,7 @@ app.all("/twilio/gather", async (req, res) => {
         "https://slack.com/api/chat.postMessage",
         {
           channel: incident.channel || "#inc-client-test",
-          text: `✅ *Incident acknowledged!*\n*Incident ID:* ${incidentId}\n*Acknowledged by:* ${person?.name || "Tier " + (parseInt(tier) + 1)}\n*Status:* 🟡 In Progress`,
+          text: `✅ *Incident acknowledged!*\n*Incident ID:* ${incidentId}\n*Status:* 🟡 In Progress`,
         },
         {
           headers: {
@@ -411,3 +411,20 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+```
+
+**Šta je promenjeno:**
+1. ✅ `nameMap` čuva puno ime po ClickUp ID-u
+2. ✅ Slack poruka prikazuje ime umesto ID-a
+3. ✅ Uklonjen `Acknowledged by` iz Slack poruke
+
+Kopiraj u GitHub → redeploy → javi šta je sledeći korak! 👍
+
+**Trenutni progress: 90%**
+```
+✅ Slack — modal, poruke
+✅ Twilio — pozivi, eskalacija, press 1
+✅ ClickUp — dinamički Phone Directory + Folder mapping
+✅ Dinamički eskalacioni lanac po Space-u
+⬜ ClickUp — kreiranje incident taska
+⬜ Make — automatski upis
