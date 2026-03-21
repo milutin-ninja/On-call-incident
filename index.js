@@ -92,14 +92,19 @@ async function getSpaceNameForFolder(folderId) {
 }
 
 // Gradi eskalacioni lanac na osnovu channel ID-a
-async function buildEscalationChain(channelId) {
-  const envKey = `SLACK_CHANNEL_${channelId}`;
-  const folderId = process.env[envKey];
+async function buildEscalationChain(channelId, channelName) {
+  // Traži varijablu po channel ID-u u svim env varijablama
+  const envVar = Object.keys(process.env).find(
+    key => key.startsWith("SLACK_CHANNEL_") && key.includes(channelId)
+  );
+  const folderId = envVar ? process.env[envVar] : null;
 
   if (!folderId) {
-    console.error(`❌ No mapping for channel ${channelId} (env: ${envKey})`);
+    console.error(`❌ No mapping for channel ${channelId}`);
     return null;
   }
+
+  console.log(`✅ Found mapping: ${envVar} → folder ${folderId}`);
 
   const phoneDirectory = await getPhoneDirectory();
   console.log("📋 Phone Directory:", phoneDirectory);
