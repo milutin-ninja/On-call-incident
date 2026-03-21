@@ -39,6 +39,7 @@ async function getPhoneDirectory() {
     );
     const content = response.data.content;
     const phoneMap = {};
+    const folderMap = {};
 
     const rows = content.split("\n").filter(row => row.startsWith("|") && !row.includes("---") && !row.includes("Profil"));
     for (const row of rows) {
@@ -46,35 +47,22 @@ async function getPhoneDirectory() {
       if (cells.length >= 3) {
         const profileCell = cells[0];
         const phone = cells[2];
+        const folderIds = cells[3] ? cells[3].split(",").map(id => id.trim()).filter(Boolean) : [];
         const match = profileCell.match(/user_mention#(\d+)/);
         if (match) {
           phoneMap[match[1]] = phone;
+          for (const folderId of folderIds) {
+            folderMap[folderId] = { clickupId: match[1], phone };
+          }
         }
       }
     }
     console.log("📋 Phone Directory loaded:", phoneMap);
-    return phoneMap;
+    console.log("📋 Folder Map loaded:", folderMap);
+    return { phoneMap, folderMap };
   } catch (err) {
     console.error("❌ Error reading Phone Directory:", err.message);
-    return {};
-  }
-}
-
-// Čita assignee iz task liste foldera
-async function getListAssignee(listId) {
-  try {
-    const response = await axios.get(
-      `https://api.clickup.com/api/v2/list/${listId}/task`,
-      { headers: { Authorization: CLICKUP_API_KEY } }
-    );
-    const tasks = response.data.tasks;
-    if (tasks && tasks.length > 0 && tasks[0].assignees.length > 0) {
-      return tasks[0].assignees[0];
-    }
-    return null;
-  } catch (err) {
-    console.error("❌ Error reading list tasks:", err.message);
-    return null;
+    return { phoneMap: {}, folderMap: {} };
   }
 }
 
@@ -97,7 +85,6 @@ async function buildEscalationChain(channelId) {
   console.log(`🔍 Building escalation chain for channel: ${channelId}`);
   console.log(`🔍 All env vars with SLACK_CHANNEL:`, Object.keys(process.env).filter(k => k.startsWith("SLACK_CHANNEL_")));
 
-  // Traži varijablu po channel ID-u u svim env varijablama
   const envVar = Object.keys(process.env).find(
     key => key.startsWith("SLACK_CHANNEL_") && key.includes(channelId)
   );
@@ -110,12 +97,11 @@ async function buildEscalationChain(channelId) {
     return null;
   }
 
-  const phoneDirectory = await getPhoneDirectory();
+  const { phoneMap, folderMap } = await getPhoneDirectory();
 
-  // Tier 1 — assignee iz task liste foldera
-  const listId = "901414563380";
-  const assignee = await getListAssignee(listId);
-  console.log("👤 Assignee:", assignee?.username, assignee?.id);
+  // Tier 1 — Developer iz Phone Directory po folder ID-u
+  const developer = folderMap[folderId];
+  console.log(`👤 Developer for folder ${folderId}:`, developer);
 
   // Space ime za Team Lead lookup
   const spaceName = await getSpaceNameForFolder(folderId);
@@ -126,21 +112,18 @@ async function buildEscalationChain(channelId) {
 
   const chain = [];
 
-  // Tier 1 — Developer (assignee)
-  if (assignee) {
-    const phone = phoneDirectory[String(assignee.id)];
-    console.log(`📞 Tier 1 — ${assignee.username}: phone=${phone}`);
+  // Tier 1 — Developer
+  if (developer) {
     chain.push({
-      name: assignee.username || assignee.email,
-      phone: phone || null,
+      name: developer.clickupId,
+      phone: developer.phone,
       tier: 1,
     });
   }
 
   // Tier 2 — Team Lead
   if (teamLead) {
-    const phone = teamLead.clickupId ? phoneDirectory[teamLead.clickupId] : null;
-    console.log(`📞 Tier 2 — ${teamLead.name}: phone=${phone}`);
+    const phone = teamLead.clickupId ? phoneMap[teamLead.clickupId] : null;
     chain.push({
       name: teamLead.name,
       phone: phone || null,
@@ -149,8 +132,7 @@ async function buildEscalationChain(channelId) {
   }
 
   // Tier 3 — CTO
-  const ctoPhone = cto.clickupId ? phoneDirectory[cto.clickupId] : null;
-  console.log(`📞 Tier 3 — ${cto.name}: phone=${ctoPhone}`);
+  const ctoPhone = cto.clickupId ? phoneMap[cto.clickupId] : null;
   chain.push({
     name: cto.name,
     phone: ctoPhone || null,
@@ -375,7 +357,6 @@ app.post("/slack/interactions", async (req, res) => {
     const channel = payload.view.private_metadata;
 
     const incidentId = `INC-${Date.now()}`;
-
     const escalationChain = await buildEscalationChain(channel);
 
     activeIncidents[incidentId] = {
@@ -392,16 +373,12 @@ app.post("/slack/interactions", async (req, res) => {
 
     res.json({ response_action: "clear" });
 
-    const chainText = escalationChain
-      ? escalationChain.map(p => `Tier ${p.tier}: ${p.name}`).join(" → ")
-      : "No escalation chain found!";
-
     try {
       await axios.post(
         "https://slack.com/api/chat.postMessage",
         {
           channel: channel || "#inc-client-test",
-          text: `🚨 *New Incident — ${incidentId}*\n*Severity:* ${severity}\n*Type:* ${type}\n*Reported by:* @${user}\n*Description:* ${description}\n\n📞 *Escalation chain:* ${chainText}\n_Initiating call escalation..._`,
+          text: `🚨 *New Incident — ${incidentId}*\n*Severity:* ${severity}\n*Type:* ${type}\n*Reported by:* @${user}\n*Description:* ${description}\n\n_Initiating call escalation..._`,
         },
         {
           headers: {
