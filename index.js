@@ -52,6 +52,7 @@ async function getPhoneDirectory() {
         }
       }
     }
+    console.log("📋 Phone Directory loaded:", phoneMap);
     return phoneMap;
   } catch (err) {
     console.error("❌ Error reading Phone Directory:", err.message);
@@ -92,27 +93,29 @@ async function getSpaceNameForFolder(folderId) {
 }
 
 // Gradi eskalacioni lanac na osnovu channel ID-a
-async function buildEscalationChain(channelId, channelName) {
+async function buildEscalationChain(channelId) {
+  console.log(`🔍 Building escalation chain for channel: ${channelId}`);
+  console.log(`🔍 All env vars with SLACK_CHANNEL:`, Object.keys(process.env).filter(k => k.startsWith("SLACK_CHANNEL_")));
+
   // Traži varijablu po channel ID-u u svim env varijablama
   const envVar = Object.keys(process.env).find(
     key => key.startsWith("SLACK_CHANNEL_") && key.includes(channelId)
   );
   const folderId = envVar ? process.env[envVar] : null;
 
+  console.log(`🔍 Found env var: ${envVar} → folder: ${folderId}`);
+
   if (!folderId) {
     console.error(`❌ No mapping for channel ${channelId}`);
     return null;
   }
 
-  console.log(`✅ Found mapping: ${envVar} → folder ${folderId}`);
-
   const phoneDirectory = await getPhoneDirectory();
-  console.log("📋 Phone Directory:", phoneDirectory);
 
   // Tier 1 — assignee iz task liste foldera
   const listId = "901414563380";
   const assignee = await getListAssignee(listId);
-  console.log("👤 Assignee:", assignee);
+  console.log("👤 Assignee:", assignee?.username, assignee?.id);
 
   // Space ime za Team Lead lookup
   const spaceName = await getSpaceNameForFolder(folderId);
@@ -126,6 +129,7 @@ async function buildEscalationChain(channelId, channelName) {
   // Tier 1 — Developer (assignee)
   if (assignee) {
     const phone = phoneDirectory[String(assignee.id)];
+    console.log(`📞 Tier 1 — ${assignee.username}: phone=${phone}`);
     chain.push({
       name: assignee.username || assignee.email,
       phone: phone || null,
@@ -136,6 +140,7 @@ async function buildEscalationChain(channelId, channelName) {
   // Tier 2 — Team Lead
   if (teamLead) {
     const phone = teamLead.clickupId ? phoneDirectory[teamLead.clickupId] : null;
+    console.log(`📞 Tier 2 — ${teamLead.name}: phone=${phone}`);
     chain.push({
       name: teamLead.name,
       phone: phone || null,
@@ -145,13 +150,14 @@ async function buildEscalationChain(channelId, channelName) {
 
   // Tier 3 — CTO
   const ctoPhone = cto.clickupId ? phoneDirectory[cto.clickupId] : null;
+  console.log(`📞 Tier 3 — ${cto.name}: phone=${ctoPhone}`);
   chain.push({
     name: cto.name,
     phone: ctoPhone || null,
     tier: 3,
   });
 
-  console.log("📞 Escalation chain:", chain);
+  console.log("✅ Final escalation chain:", JSON.stringify(chain));
   return chain;
 }
 
