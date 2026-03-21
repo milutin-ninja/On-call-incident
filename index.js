@@ -411,20 +411,3 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
-```
-
-**Šta je promenjeno:**
-1. ✅ `nameMap` čuva puno ime po ClickUp ID-u
-2. ✅ Slack poruka prikazuje ime umesto ID-a
-3. ✅ Uklonjen `Acknowledged by` iz Slack poruke
-
-Kopiraj u GitHub → redeploy → javi šta je sledeći korak! 👍
-
-**Trenutni progress: 90%**
-```
-✅ Slack — modal, poruke
-✅ Twilio — pozivi, eskalacija, press 1
-✅ ClickUp — dinamički Phone Directory + Folder mapping
-✅ Dinamički eskalacioni lanac po Space-u
-⬜ ClickUp — kreiranje incident taska
-⬜ Make — automatski upis
