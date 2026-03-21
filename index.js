@@ -12,41 +12,173 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
 const RAILWAY_URL = process.env.RAILWAY_URL;
+const CLICKUP_API_KEY = process.env.CLICKUP_API_KEY;
+const CLICKUP_PHONE_DOC_ID = "8cn80zu-52054";
+const CLICKUP_PHONE_PAGE_ID = "8cn80zu-65534";
 
-const ON_CALL_NUMBERS = [
-  process.env.TWILIO_TO_NUMBER,
-  process.env.TWILIO_TO_NUMBER_T2,
-  process.env.TWILIO_TO_NUMBER_T3,
-  process.env.TWILIO_TO_NUMBER_T4,
-];
+// Team Lead mapping po Space-u
+const TEAM_LEADS = {
+  "NPD Team": { name: "Andrija Djuric", clickupId: "42457090" },
+  "New Cookies Team": { name: "Filip Nicic", clickupId: null },
+  "Imperija Team": { name: "Marko Vukic", clickupId: null },
+  "Test Team": { name: "Nemanja Vasilevski", clickupId: null },
+};
+
+// CTO je uvek Tier 3
+const CTO = { name: "Stefan Mikic", clickupId: "42457093" };
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-
 const activeIncidents = {};
 
-async function escalateCall(incidentId, tierIndex = 0) {
-  if (tierIndex >= ON_CALL_NUMBERS.length) {
-    console.error(`❌ Incident ${incidentId}: Svi tierovi pozvani, niko se nije javio!`);
-    return;
+// Čita Phone Directory iz ClickUp dokumenta
+async function getPhoneDirectory() {
+  try {
+    const response = await axios.get(
+      `https://api.clickup.com/api/v3/workspaces/9014871034/docs/${CLICKUP_PHONE_DOC_ID}/pages/${CLICKUP_PHONE_PAGE_ID}`,
+      { headers: { Authorization: CLICKUP_API_KEY } }
+    );
+    const content = response.data.content;
+    const phoneMap = {};
+
+    const rows = content.split("\n").filter(row => row.startsWith("|") && !row.includes("---") && !row.includes("Profil"));
+    for (const row of rows) {
+      const cells = row.split("|").map(c => c.trim()).filter(Boolean);
+      if (cells.length >= 3) {
+        const profileCell = cells[0];
+        const phone = cells[2];
+        const match = profileCell.match(/user_mention#(\d+)/);
+        if (match) {
+          phoneMap[match[1]] = phone;
+        }
+      }
+    }
+    return phoneMap;
+  } catch (err) {
+    console.error("❌ Error reading Phone Directory:", err.message);
+    return {};
+  }
+}
+
+// Čita assignee iz task liste foldera
+async function getListAssignee(listId) {
+  try {
+    const response = await axios.get(
+      `https://api.clickup.com/api/v2/list/${listId}/task`,
+      { headers: { Authorization: CLICKUP_API_KEY } }
+    );
+    const tasks = response.data.tasks;
+    if (tasks && tasks.length > 0 && tasks[0].assignees.length > 0) {
+      return tasks[0].assignees[0];
+    }
+    return null;
+  } catch (err) {
+    console.error("❌ Error reading list tasks:", err.message);
+    return null;
+  }
+}
+
+// Pronađi space ime na osnovu folder ID-a
+async function getSpaceNameForFolder(folderId) {
+  try {
+    const response = await axios.get(
+      `https://api.clickup.com/api/v2/folder/${folderId}`,
+      { headers: { Authorization: CLICKUP_API_KEY } }
+    );
+    return response.data.space?.name || null;
+  } catch (err) {
+    console.error("❌ Error getting space name:", err.message);
+    return null;
+  }
+}
+
+// Gradi eskalacioni lanac na osnovu channel ID-a
+async function buildEscalationChain(channelId) {
+  const envKey = `SLACK_CHANNEL_${channelId}`;
+  const folderId = process.env[envKey];
+
+  if (!folderId) {
+    console.error(`❌ No mapping for channel ${channelId} (env: ${envKey})`);
+    return null;
   }
 
+  const phoneDirectory = await getPhoneDirectory();
+  console.log("📋 Phone Directory:", phoneDirectory);
+
+  // Tier 1 — assignee iz task liste foldera
+  const listId = "901414563380";
+  const assignee = await getListAssignee(listId);
+  console.log("👤 Assignee:", assignee);
+
+  // Space ime za Team Lead lookup
+  const spaceName = await getSpaceNameForFolder(folderId);
+  console.log("🏢 Space:", spaceName);
+
+  const teamLead = spaceName ? TEAM_LEADS[spaceName] : null;
+  const cto = CTO;
+
+  const chain = [];
+
+  // Tier 1 — Developer (assignee)
+  if (assignee) {
+    const phone = phoneDirectory[String(assignee.id)];
+    chain.push({
+      name: assignee.username || assignee.email,
+      phone: phone || null,
+      tier: 1,
+    });
+  }
+
+  // Tier 2 — Team Lead
+  if (teamLead) {
+    const phone = teamLead.clickupId ? phoneDirectory[teamLead.clickupId] : null;
+    chain.push({
+      name: teamLead.name,
+      phone: phone || null,
+      tier: 2,
+    });
+  }
+
+  // Tier 3 — CTO
+  const ctoPhone = cto.clickupId ? phoneDirectory[cto.clickupId] : null;
+  chain.push({
+    name: cto.name,
+    phone: ctoPhone || null,
+    tier: 3,
+  });
+
+  console.log("📞 Escalation chain:", chain);
+  return chain;
+}
+
+// Eskalacija
+async function escalateCall(incidentId, tierIndex = 0) {
   const incident = activeIncidents[incidentId];
   if (!incident) {
-    console.error(`❌ Incident ${incidentId} nije pronađen u memoriji!`);
+    console.error(`❌ Incident ${incidentId} not found!`);
     return;
   }
 
-  const toNumber = ON_CALL_NUMBERS[tierIndex];
-  const tierName = `Tier ${tierIndex + 1}`;
+  const chain = incident.escalationChain;
 
-  console.log(`📞 Pokušavam poziv: ${tierName} → ${toNumber}`);
-  console.log(`📋 Twilio FROM: ${TWILIO_FROM_NUMBER}`);
-  console.log(`📋 Twilio SID: ${TWILIO_ACCOUNT_SID}`);
-  console.log(`📋 Railway URL: ${RAILWAY_URL}`);
+  if (!chain || tierIndex >= chain.length) {
+    console.error(`❌ Incident ${incidentId}: All tiers called, no one answered!`);
+    return;
+  }
+
+  const person = chain[tierIndex];
+  const tierName = `Tier ${person.tier}`;
+
+  if (!person.phone) {
+    console.error(`❌ ${person.name} has no phone number in Phone Directory!`);
+    escalateCall(incidentId, tierIndex + 1);
+    return;
+  }
+
+  console.log(`📞 Calling ${tierName} — ${person.name}: ${person.phone}`);
 
   try {
     const call = await twilioClient.calls.create({
-      to: toNumber,
+      to: person.phone,
       from: TWILIO_FROM_NUMBER,
       url: `${RAILWAY_URL}/twilio/voice?incidentId=${incidentId}&tier=${tierIndex}`,
       statusCallback: `${RAILWAY_URL}/twilio/status?incidentId=${incidentId}&tier=${tierIndex}`,
@@ -54,20 +186,19 @@ async function escalateCall(incidentId, tierIndex = 0) {
       timeout: 30,
     });
 
-    console.log(`✅ Poziv pokrenut za ${tierName}: ${call.sid}`);
+    console.log(`✅ Call initiated for ${tierName}: ${call.sid}`);
     activeIncidents[incidentId].callSid = call.sid;
     activeIncidents[incidentId].currentTier = tierIndex;
 
     activeIncidents[incidentId].escalationTimer = setTimeout(() => {
       if (!activeIncidents[incidentId]?.acknowledged) {
-        console.log(`⏰ Incident ${incidentId}: ${tierName} nije potvrdio, eskalujem...`);
+        console.log(`⏰ ${tierName} did not confirm, escalating...`);
         escalateCall(incidentId, tierIndex + 1);
       }
     }, 120000);
 
   } catch (err) {
-    console.error(`❌ Twilio greška za ${tierName}:`, err.message);
-    console.error(`❌ Twilio detalji:`, err.code, err.status);
+    console.error(`❌ Twilio error for ${tierName}:`, err.message);
     escalateCall(incidentId, tierIndex + 1);
   }
 }
@@ -75,7 +206,9 @@ async function escalateCall(incidentId, tierIndex = 0) {
 app.all("/twilio/voice", (req, res) => {
   const { incidentId, tier } = req.query;
   const incident = activeIncidents[incidentId];
-  const tierName = `Tier ${parseInt(tier) + 1}`;
+  const chain = incident?.escalationChain;
+  const person = chain?.[parseInt(tier)];
+  const tierName = person ? `Tier ${person.tier}` : `Tier ${parseInt(tier) + 1}`;
 
   const severity = incident?.severity || "Unknown";
   const type = incident?.type || "Unknown";
@@ -91,19 +224,21 @@ app.all("/twilio/gather", async (req, res) => {
   const { incidentId, tier } = req.query;
   const digit = req.body?.Digits || req.query?.Digits;
   const incident = activeIncidents[incidentId];
+  const chain = incident?.escalationChain;
+  const person = chain?.[parseInt(tier)];
 
   if (digit === "1" && incident) {
     incident.acknowledged = true;
     clearTimeout(incident.escalationTimer);
 
-    console.log(`✅ Incident ${incidentId}: Tier ${parseInt(tier) + 1} potvrdio!`);
+    console.log(`✅ Incident ${incidentId}: ${person?.name || "Tier " + (parseInt(tier) + 1)} acknowledged!`);
 
     try {
       await axios.post(
         "https://slack.com/api/chat.postMessage",
         {
           channel: incident.channel || "#inc-client-test",
-          text: `✅ *Incident acknowledged!*\n*Incident ID:* ${incidentId}\n*Acknowledged by:* Tier ${parseInt(tier) + 1}\n*Status:* 🟡 In Progress`,
+          text: `✅ *Incident acknowledged!*\n*Incident ID:* ${incidentId}\n*Acknowledged by:* ${person?.name || "Tier " + (parseInt(tier) + 1)}\n*Status:* 🟡 In Progress`,
         },
         {
           headers: {
@@ -119,7 +254,6 @@ app.all("/twilio/gather", async (req, res) => {
     const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">Thank you. You have acknowledged the incident. Please check Slack for details. Good luck.</Say></Response>`;
     res.type("text/xml");
     res.send(twiml);
-
   } else {
     const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">Invalid input. Escalating to next tier.</Say></Response>`;
     res.type("text/xml");
@@ -132,8 +266,10 @@ app.post("/twilio/status", (req, res) => {
   const { incidentId, tier } = req.query;
   const callStatus = req.body.CallStatus;
   const incident = activeIncidents[incidentId];
+  const chain = incident?.escalationChain;
+  const person = chain?.[parseInt(tier)];
 
-  console.log(`📋 Incident ${incidentId} Tier ${parseInt(tier) + 1} status: ${callStatus}`);
+  console.log(`📋 Incident ${incidentId} ${person?.name || "Tier " + (parseInt(tier) + 1)} status: ${callStatus}`);
 
   if (
     !incident?.acknowledged &&
@@ -229,6 +365,8 @@ app.post("/slack/interactions", async (req, res) => {
 
     const incidentId = `INC-${Date.now()}`;
 
+    const escalationChain = await buildEscalationChain(channel);
+
     activeIncidents[incidentId] = {
       id: incidentId,
       severity,
@@ -237,17 +375,22 @@ app.post("/slack/interactions", async (req, res) => {
       user,
       channel,
       acknowledged: false,
+      escalationChain,
       createdAt: new Date().toISOString(),
     };
 
     res.json({ response_action: "clear" });
+
+    const chainText = escalationChain
+      ? escalationChain.map(p => `Tier ${p.tier}: ${p.name}`).join(" → ")
+      : "No escalation chain found!";
 
     try {
       await axios.post(
         "https://slack.com/api/chat.postMessage",
         {
           channel: channel || "#inc-client-test",
-          text: `🚨 *New Incident — ${incidentId}*\n*Severity:* ${severity}\n*Type:* ${type}\n*Reported by:* @${user}\n*Description:* ${description}\n\n📞 _Pokrećem eskalaciju poziva..._`,
+          text: `🚨 *New Incident — ${incidentId}*\n*Severity:* ${severity}\n*Type:* ${type}\n*Reported by:* @${user}\n*Description:* ${description}\n\n📞 *Escalation chain:* ${chainText}\n_Initiating call escalation..._`,
         },
         {
           headers: {
@@ -260,7 +403,11 @@ app.post("/slack/interactions", async (req, res) => {
       console.error("Error posting to Slack:", err.response?.data || err.message);
     }
 
-    escalateCall(incidentId, 0);
+    if (escalationChain && escalationChain.length > 0) {
+      escalateCall(incidentId, 0);
+    } else {
+      console.error(`❌ Incident ${incidentId}: No escalation chain for channel ${channel}`);
+    }
 
     return;
   }
