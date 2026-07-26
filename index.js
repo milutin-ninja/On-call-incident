@@ -1,22 +1,109 @@
+// =============================================================================
+//  ON-CALL INCIDENT BOT  —  Slack -> Twilio (pozivi) -> ClickUp (task)
+// =============================================================================
+//
+//  ŠTA OVO RADI (ukratko):
+//  1. Klijent u svom Slack kanalu pokrene slash komandu -> otvori se modal
+//     forma (severity / type / description).            [POST /slack/command]
+//  2. Na submit forme: Slack kanal se preslika u ClickUp FOLDER (projekat),
+//     iz foldera se izgradi "escalation chain" i krene zvonjava.
+//                                                  [POST /slack/interactions]
+//  3. Twilio zove ljude po redu (Tier 1 -> 2 -> 3). Ako se neko ne javi,
+//     odbije, ili ne pritisne 1 u roku od 2 minuta -> ide sledeći.
+//                                    [escalateCall + /twilio/voice /status]
+//  4. Prvi ko pritisne 1 preuzima incident: TADA se pravi task u ClickUp-u
+//     i link se postuje u Slack.                        [POST /twilio/gather]
+//
+//  ESKALACIONI LANAC (3 nivoa):
+//    Tier 1 = developer zadužen za projekat (iz Phone Directory dokumenta)
+//    Tier 2 = team lead njegovog ClickUp Space-a (iz TEAM_LEADS niže)
+//    Tier 3 = CTO (iz CTO konstante niže)
+//  Ako neko nema broj telefona, taj nivo se preskače (ne prekida se lanac).
+//
+// -----------------------------------------------------------------------------
+//  ⚠️  ŠTA SE ODRŽAVA RUČNO — pročitaj ovo pre nego što diraš bilo šta
+// -----------------------------------------------------------------------------
+//  Postoje 4 mesta koja se ručno ažuriraju kad se doda klijent ili se promeni
+//  tim. Detaljna uputstva su u komentarima na samim mestima u kodu:
+//
+//  (A) Railway env varijabla po klijentu:  SLACK_CHANNEL_<ime>_<CHANNEL_ID>
+//      -> vrednost = ClickUp FOLDER ID tog projekta.   [vidi buildEscalationChain]
+//  (B) ClickUp "Phone Directory" dokument (telefoni + folderi po developeru)
+//      -> živi u ClickUp-u, NE u kodu.                 [vidi getPhoneDirectory]
+//  (C) TEAM_LEADS konstanta u ovom fajlu.              [vidi TEAM_LEADS]
+//  (D) Lista "Incidents" unutar svakog projektnog foldera u ClickUp-u.
+//                                                      [vidi resolveListId]
+// =============================================================================
+
 import express from "express";
 import bodyParser from "body-parser";
 import axios from "axios";
 import twilio from "twilio";
 
 const app = express();
+// Slack šalje form-urlencoded, Twilio takođe. JSON je za svaki slučaj.
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
+// -----------------------------------------------------------------------------
+//  ENV VARIJABLE (sve se postavljaju u Railway -> Variables)
+// -----------------------------------------------------------------------------
+//  SLACK_BOT_TOKEN     Slack app "Bot User OAuth Token" (xoxb-...).
+//                      Potrebni scope-ovi: chat:write, commands.
+//  TWILIO_ACCOUNT_SID  Twilio Console -> Account Info.
+//  TWILIO_AUTH_TOKEN   Twilio Console -> Account Info.
+//  TWILIO_FROM_NUMBER  Twilio broj sa kog se zove, u E.164 formatu (+381...).
+//  RAILWAY_URL         Javni URL ovog servisa, BEZ kose crte na kraju.
+//                      ⚠️ Twilio sa ovog URL-a čita instrukcije za poziv —
+//                      ako je pogrešan, pozivi zvone ali niko ne čuje poruku.
+//  CLICKUP_API_KEY     ClickUp personal API token (pk_...).
+//                      ⚠️ Šalje se kao raw vrednost, BEZ "Bearer " prefiksa.
+// -----------------------------------------------------------------------------
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
 const RAILWAY_URL = process.env.RAILWAY_URL;
 const CLICKUP_API_KEY = process.env.CLICKUP_API_KEY;
-const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
+
+// -----------------------------------------------------------------------------
+//  RUČNO (B) — lokacija "Phone Directory" dokumenta u ClickUp-u
+// -----------------------------------------------------------------------------
+//  Hardkodovano jer se ovaj dokument praktično nikad ne menja (menja se njegov
+//  SADRŽAJ, ne lokacija). Sadržaj se čita u realnom vremenu pri svakom
+//  incidentu, tako da izmena telefona u ClickUp-u odmah radi — BEZ redeploya.
+//
+//  Kako naći ove ID-jeve: otvori dokument u ClickUp-u i pogledaj URL:
+//    .../docs/<CLICKUP_PHONE_DOC_ID>/<CLICKUP_PHONE_PAGE_ID>
+//  Ako neko napravi NOVI dokument umesto da edituje postojeći, ove dve
+//  vrednosti moraju da se promene ovde i da se odradi redeploy.
+// -----------------------------------------------------------------------------
 const CLICKUP_PHONE_DOC_ID = "8cn80zu-52054";
 const CLICKUP_PHONE_PAGE_ID = "8cn80zu-65534";
 
+// -----------------------------------------------------------------------------
+//  RUČNO (C) — TEAM LEADS (Tier 2 eskalacije)
+// -----------------------------------------------------------------------------
+//  KLJUČ = tačno ime ClickUp SPACE-a u kome projekat živi.
+//  ⚠️ Ime mora da se poklapa KARAKTER ZA KARAKTER sa imenom Space-a u ClickUp-u
+//     (poredi se bez ikakve normalizacije). Ako neko preimenuje Space u
+//     ClickUp-u, Tier 2 tiho prestaje da radi — lanac preskoči team leada i
+//     ide direktno na CTO-a. U logu se to vidi kao:  🏢 Space: <novo ime>
+//     a "Final escalation chain" nema tier 2.
+//
+//  clickupId = ClickUp user ID te osobe. Služi da se iz Phone Directory
+//     dokumenta izvuče njegov TELEFON i ime.
+//  ⚠️ Ako je clickupId = null, ta osoba NEMA telefon u sistemu i Tier 2 se
+//     preskače. Da bi team lead počeo da se zove:
+//       1. dodaj mu red u Phone Directory dokument (sa @mention i brojem)
+//       2. upiši njegov ClickUp user ID ovde umesto null
+//
+//  Kako naći ClickUp user ID: u Phone Directory dokumentu @mention se u API
+//  odgovoru vidi kao "user_mention#42457090" — broj je user ID.
+//
+//  KAD SE DODAJE NOV TIM: dodaj novi red { "Ime Space-a": { name, clickupId } }
+//  i redeployuj (ova konstanta se čita samo pri startu procesa).
+// -----------------------------------------------------------------------------
 const TEAM_LEADS = {
   "NPD Team": { name: "Andrija Djuric", clickupId: "42457090" },
   "New Cookies Team": { name: "Filip Nicic", clickupId: null },
@@ -24,13 +111,74 @@ const TEAM_LEADS = {
   "Test Team": { name: "Nemanja Vasilevski", clickupId: null },
 };
 
+// -----------------------------------------------------------------------------
+//  RUČNO (C) — CTO (Tier 3, poslednja instanca)
+// -----------------------------------------------------------------------------
+//  Zove se uvek kao zadnji nivo, za SVE projekte, bez obzira na Space.
+//  ⚠️ Ovo je zadnja mreza u lancu — ako ovde nema važećeg telefona (tj. ako
+//     clickupId ne postoji u Phone Directory dokumentu), incident može da
+//     prođe bez ijednog odgovora. Proveri posle svake promene CTO-a.
+// -----------------------------------------------------------------------------
 const CTO = { name: "Stefan Mikic", clickupId: "42457093" };
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+// -----------------------------------------------------------------------------
+//  activeIncidents — IN-MEMORY skladište aktivnih incidenata
+// -----------------------------------------------------------------------------
+//  Ključ = incidentId ("INC-<timestamp>"), vrednost = ceo objekat incidenta.
+//  ⚠️ OGRANIČENJE KOJE TREBA ZNATI: ovo je običan objekat u RAM-u.
+//     Redeploy ili restart Railway servisa BRIŠE sve aktivne incidente.
+//     Posledica: ako se incident desi tokom deploya, poziv koji je u toku
+//     više ne može da se potvrdi (u /twilio/gather incident bude undefined,
+//     task se ne napravi). Zato: ne deployuj dok je incident aktivan.
+//     Ako ovo ikad postane problem — zamena je Redis ili ClickUp kao izvor
+//     istine, ali za trenutni obim (nekoliko incidenata mesečno) je OK.
+//  Napomena: incidenti se nikad ne brišu iz memorije (mali leak, ali proces
+//     se restartuje na svaki deploy pa se u praksi ne akumulira).
+// -----------------------------------------------------------------------------
 const activeIncidents = {};
 
+// -----------------------------------------------------------------------------
+//  getPhoneDirectory()
+// -----------------------------------------------------------------------------
+//  Čita ClickUp dokument "Phone Directory" i parsira ga kao markdown tabelu.
+//
+//  ⚠️ RUČNO (B) — OVAJ DOKUMENT JE JEDINI IZVOR TELEFONA. Format tabele mora
+//     da ostane isti jer se parsira po REDOSLEDU KOLONA (ne po imenu kolone):
+//
+//       | Profil (@mention) | Ime i prezime | Telefon      | Folder ID-jevi |
+//       |-------------------|---------------|--------------|----------------|
+//       | @Pera Peric       | Pera Peric    | +3816...     | 90141..,90142..|
+//
+//     kolona 0 -> @mention osobe (odavde se regexom vadi ClickUp user ID)
+//     kolona 1 -> ime koje se izgovara u pozivu i prikazuje u Slacku
+//     kolona 2 -> telefon; MORA biti u E.164 formatu (+381...) da Twilio radi
+//     kolona 3 -> ClickUp FOLDER ID-jevi projekata za koje je taj čovek
+//                 zadužen, razdvojeni zapazom. Jedan čovek može imati više
+//                 projekata. Ovo je ono što ga čini "Tier 1" za taj projekat.
+//
+//  ⚠️ ZAMKE PRI EDITOVANJU DOKUMENTA:
+//     - Kolona 0 mora sadržati pravi @mention (ne samo tekst imena), inače
+//       regex ne nađe user ID i CEO RED se tiho ignoriše.
+//     - Redovi zaglavlja se preskaču tako što se filtrira reč "Profil" —
+//       ako preimenuješ prvu kolonu, zaglavlje će biti parsirano kao osoba.
+//     - Telefon bez "+" i pozivnog broja = Twilio odbija poziv.
+//
+//  Vraća tri mape:
+//    phoneMap[clickupId] -> telefon        (za TEAM_LEADS i CTO)
+//    nameMap[clickupId]  -> ime i prezime  (za TEAM_LEADS i CTO)
+//    folderMap[folderId] -> developer      (za Tier 1, po projektu)
+//
+//  Ako čitanje padne, vraća prazne mape — lanac tada ostane bez telefona i
+//  incident prođe bez poziva, pa greška "❌ Error reading Phone Directory"
+//  u logu je kritična i traži hitnu reakciju.
+// -----------------------------------------------------------------------------
 async function getPhoneDirectory() {
   try {
+    // ⚠️ 9014871034 je Flow Ninja ClickUp WORKSPACE (team) ID — hardkodovan.
+    //    Menja se samo ako se ceo workspace menja. Ovo je ClickUp API v3
+    //    (docs endpoint živi samo na v3; taskovi niže koriste v2).
     const response = await axios.get(
       `https://api.clickup.com/api/v3/workspaces/9014871034/docs/${CLICKUP_PHONE_DOC_ID}/pages/${CLICKUP_PHONE_PAGE_ID}`,
       { headers: { Authorization: CLICKUP_API_KEY } }
@@ -40,19 +188,29 @@ async function getPhoneDirectory() {
     const folderMap = {};
     const nameMap = {};
 
+    // Zadrži samo redove tabele: počinju sa "|", nisu separator "---",
+    // i nisu zaglavlje (prepoznaje se po reči "Profil").
     const rows = content.split("\n").filter(row => row.startsWith("|") && !row.includes("---") && !row.includes("Profil"));
     for (const row of rows) {
+      // filter(Boolean) izbacuje prazne stringove koji nastaju od vodećeg
+      // i završnog "|" u markdown redu.
       const cells = row.split("|").map(c => c.trim()).filter(Boolean);
       if (cells.length >= 3) {
         const profileCell = cells[0];
         const fullName = cells[1];
         const phone = cells[2];
+        // Kolona sa folderima je opciona — osoba bez foldera je i dalje
+        // dostupna kao team lead / CTO preko phoneMap, samo nije Tier 1.
         const folderIds = cells[3] ? cells[3].split(",").map(id => id.trim()).filter(Boolean) : [];
+        // Iz @mention-a ClickUp vraća oblik "user_mention#42457090".
         const match = profileCell.match(/user_mention#(\d+)/);
         if (match) {
           const clickupId = match[1];
           phoneMap[clickupId] = phone;
           nameMap[clickupId] = fullName;
+          // ⚠️ Ako su dva čoveka upisana na ISTI folder, poslednji red u
+          //    tabeli pobeđuje (prepisuje prethodnog) — jedan folder ima
+          //    tačno jednog Tier 1 developera.
           for (const folderId of folderIds) {
             folderMap[folderId] = { clickupId, phone, name: fullName };
           }
@@ -68,21 +226,189 @@ async function getPhoneDirectory() {
   }
 }
 
-async function getSpaceNameForFolder(folderId) {
+// -----------------------------------------------------------------------------
+//  getFolderInfo(folderId)
+// -----------------------------------------------------------------------------
+//  Jedan ClickUp poziv koji nam daje dve stvari koje su nam obe potrebne:
+//    spaceName -> da nađemo team leada u TEAM_LEADS (Tier 2)
+//    lists     -> da nađemo u koju listu ide task (vidi resolveListId)
+//  Namerno spojeno u jedan zahtev da ne trošimo dva API poziva na isti folder.
+//  Ako padne, vraća prazno -> Tier 2 se preskoči i lista se ne razreši.
+// -----------------------------------------------------------------------------
+async function getFolderInfo(folderId) {
   try {
     const response = await axios.get(
       `https://api.clickup.com/api/v2/folder/${folderId}`,
       { headers: { Authorization: CLICKUP_API_KEY } }
     );
-    return response.data.space?.name || null;
+    return {
+      spaceName: response.data.space?.name || null,
+      lists: Array.isArray(response.data.lists) ? response.data.lists : [],
+    };
   } catch (err) {
-    console.error("❌ Error getting space name:", err.message);
-    return null;
+    console.error("❌ Error getting folder info:", err.message);
+    return { spaceName: null, lists: [] };
   }
 }
 
+// -----------------------------------------------------------------------------
+//  resolveListId(lists, folderId)
+// -----------------------------------------------------------------------------
+//  ⚠️ RUČNO (D) — ODLUČUJE U KOJU CLICKUP LISTU IDE TASK.
+//
+//  Konvencija: svaki projektni folder treba da ima listu pod imenom
+//  "Incidents". Tako ne mora da se održava mapiranje po projektu — samo
+//  napraviš listu sa tim imenom u ClickUp-u i radi.
+//
+//  Redosled odlučivanja (fallback lanac):
+//    1. lista u folderu čije ime je == CLICKUP_INCIDENT_LIST_NAME
+//       (env varijabla, default "Incidents"; poredi se case-insensitive)
+//    2. ako te liste nema -> PRVA lista u folderu (loguje ⚠️ warning)
+//    3. ako folder nema nijednu listu -> env CLICKUP_DEFAULT_LIST_ID
+//    4. ako ni to nije postavljeno -> null, task se NE pravi
+//       (createClickUpTask baca jasnu grešku)
+//
+//  ⚠️ Korak 2 je namerno "tih" fallback da incident nikad ne propadne zbog
+//     administracije, ALI znači da task može da završi u pogrešnoj listi.
+//     Zato posle dodavanja klijenta proveri log liniju:
+//       📁 Folder <id>: koristim listu "Incidents" (<listId>)
+//     Ako vidiš ⚠️ umesto 📁 — nedostaje "Incidents" lista u tom folderu.
+//
+//  Preporuka: postavi CLICKUP_DEFAULT_LIST_ID na neku "Incidents – Uncategorized"
+//  listu, da task uvek ima gde da padne i ništa se ne izgubi.
+// -----------------------------------------------------------------------------
+function resolveListId(lists, folderId) {
+  const wanted = (process.env.CLICKUP_INCIDENT_LIST_NAME || "Incidents").toLowerCase();
+
+  if (lists.length > 0) {
+    const named = lists.find(l => (l.name || "").toLowerCase() === wanted);
+    if (named) {
+      console.log(`📁 Folder ${folderId}: koristim listu "${named.name}" (${named.id})`);
+      return named.id;
+    }
+    console.warn(
+      `⚠️ Folder ${folderId}: nema liste "${wanted}", fallback na prvu listu "${lists[0].name}" (${lists[0].id})`
+    );
+    return lists[0].id;
+  }
+
+  const fallback = process.env.CLICKUP_DEFAULT_LIST_ID || null;
+  console.warn(`⚠️ Folder ${folderId}: nema nijedne liste, fallback na CLICKUP_DEFAULT_LIST_ID=${fallback}`);
+  return fallback;
+}
+
+// -----------------------------------------------------------------------------
+//  PRIORITY_MAP — severity iz Slack forme -> ClickUp priority
+// -----------------------------------------------------------------------------
+//  ClickUp priority skala: 1 = Urgent, 2 = High, 3 = Normal, 4 = Low.
+//  ⚠️ Ključevi ("P1","P2","P3") MORAJU da odgovaraju `value` poljima u Slack
+//     modalu (vidi /slack/command). Ako tamo dodaš npr. "P4", dodaj ga i ovde,
+//     inače tiho pada na 3 (Normal).
+// -----------------------------------------------------------------------------
+const PRIORITY_MAP = { P1: 1, P2: 2, P3: 3 };
+
+// -----------------------------------------------------------------------------
+//  createClickUpTask(incident, person)
+// -----------------------------------------------------------------------------
+//  Pravi task u ClickUp-u. Poziva se SAMO kad neko potvrdi poziv sa "1".
+//  (Ranije je ovaj korak radio Make webhook — Make je izbačen, sve ide odavde.)
+//
+//  person = osoba koja je potvrdila incident; ona postaje assignee.
+//  Ako ta osoba nema clickupId, task se pravi BEZ assignee-a (ne pada).
+// -----------------------------------------------------------------------------
+async function createClickUpTask(incident, person) {
+  // Bez liste nema gde da se napravi task — bacamo grešku sa folderom u
+  // tekstu da se u logu odmah vidi koji projekat nije podešen.
+  if (!incident.listId) {
+    throw new Error(`No ClickUp list resolved for incident ${incident.id} (folder ${incident.folderId})`);
+  }
+
+  const priority = PRIORITY_MAP[incident.severity] || 3;
+
+  // Opis taska. `markdown_description` (ne `description`) je ClickUp polje
+  // koje renderuje markdown — zato **bold** radi.
+  const markdown_description = [
+    `**Incident ID:** ${incident.id}`,
+    `**Severity:** ${incident.severity}`,
+    `**Type:** ${incident.type}`,
+    `**Reported by (Slack):** ${incident.user}`,
+    `**Acknowledged by:** ${person?.name || "N/A"}`,
+    `**Created:** ${incident.createdAt}`,
+    ``,
+    `**Description:**`,
+    incident.description || "No description",
+  ].join("\n");
+
+  const body = {
+    name: `[${incident.severity}] ${incident.type} — ${incident.id}`,
+    markdown_description,
+    priority,
+  };
+
+  // ⚠️ ClickUp očekuje assignees kao niz BROJEVA, a user ID-jevi se kroz
+  //    ceo ovaj fajl vuku kao stringovi (iz regexa / TEAM_LEADS) — zato Number().
+  if (person?.clickupId) {
+    body.assignees = [Number(person.clickupId)];
+  }
+
+  // Napomena: v2 endpoint za taskove (Phone Directory gore koristi v3).
+  const response = await axios.post(
+    `https://api.clickup.com/api/v2/list/${incident.listId}/task`,
+    body,
+    {
+      headers: {
+        Authorization: CLICKUP_API_KEY,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+
+  console.log(`✅ ClickUp task created for ${incident.id}: ${response.data?.id}`);
+  return response.data; // { id, url, ... }
+}
+
+// -----------------------------------------------------------------------------
+//  buildEscalationChain(channelId)
+// -----------------------------------------------------------------------------
+//  Od Slack kanala pravi listu ljudi koje treba zvati, po redu.
+//
+//  ⚠️ RUČNO (A) — MAPIRANJE SLACK KANAL -> CLICKUP FOLDER
+//  ---------------------------------------------------------------------------
+//  Radi se preko Railway env varijabli po konvenciji imena:
+//
+//      IME:      SLACK_CHANNEL_<bilo koji opis>_<SLACK_CHANNEL_ID>
+//      VREDNOST: <ClickUp FOLDER ID tog projekta>
+//
+//    Primer (postojeći):
+//      SLACK_CHANNEL_inc_client_test_C0AC5VCLAG2 = 90141234567
+//
+//  Kako se traži: uzima se prva env varijabla koja počinje sa
+//  "SLACK_CHANNEL_" i čije ime SADRŽI ID kanala. Zato deo pre ID-ja može biti
+//  šta god ti je čitljivo — samo ID mora biti tačan.
+//
+//  KAKO DODATI NOVOG KLIJENTA (3 koraka):
+//    1. U Slacku: uzmi Channel ID (Channel details -> dole "Channel ID",
+//       oblik C0ABC123DEF).
+//    2. U ClickUp-u: uzmi Folder ID projekta (otvori folder, ID je u URL-u)
+//       i napravi u njemu listu "Incidents".
+//    3. U Railway-u: dodaj varijablu SLACK_CHANNEL_<ime>_<CHANNEL_ID> sa
+//       vrednošću Folder ID. Railway se sam redeployuje.
+//    + Ne zaboravi developera: njegov red u Phone Directory dokumentu mora
+//      imati taj isti Folder ID u koloni "Folder ID-jevi" (inače nema Tier 1).
+//
+//  ⚠️ ZAMKE:
+//    - ID kanala je case-sensitive i mora biti TAČAN. Ako fali mapiranje,
+//      funkcija vraća null i incident ne pokrene NIJEDAN poziv (log:
+//      "❌ No mapping for channel ..."). Slack poruka se i dalje pošalje,
+//      pa izgleda kao da radi — obavezno proveri log posle dodavanja.
+//    - Ako dva imena varijabli sadrže isti ID, koristi se prvo nađeno.
+//
+//  Vraća { chain, folderId, listId } ili null ako kanal nije mapiran.
+// -----------------------------------------------------------------------------
 async function buildEscalationChain(channelId) {
   console.log(`🔍 Building escalation chain for channel: ${channelId}`);
+  // Ovaj log ispisuje SVE SLACK_CHANNEL_* varijable — najkorisnija stvar za
+  // debug kad neki kanal "ne radi": vidiš odmah da li mapiranje postoji.
   console.log(`🔍 All env vars with SLACK_CHANNEL:`, Object.keys(process.env).filter(k => k.startsWith("SLACK_CHANNEL_")));
 
   const envVar = Object.keys(process.env).find(
@@ -97,19 +423,28 @@ async function buildEscalationChain(channelId) {
     return null;
   }
 
+  // Čita se pri SVAKOM incidentu (namerno) — promena telefona u ClickUp
+  // dokumentu odmah stupa na snagu, bez redeploya.
   const { phoneMap, folderMap, nameMap } = await getPhoneDirectory();
 
   const developer = folderMap[folderId];
   console.log(`👤 Developer for folder ${folderId}:`, developer);
 
-  const spaceName = await getSpaceNameForFolder(folderId);
+  const { spaceName, lists } = await getFolderInfo(folderId);
   console.log("🏢 Space:", spaceName);
 
+  // U koju listu ide task kad neko potvrdi (vidi resolveListId).
+  const listId = resolveListId(lists, folderId);
+
+  // Space ime -> team lead. Ako se ime Space-a ne nalazi u TEAM_LEADS,
+  // teamLead je undefined i Tier 2 se preskače (ide se pravo na CTO).
   const teamLead = spaceName ? TEAM_LEADS[spaceName] : null;
   const cto = CTO;
   const chain = [];
 
   // Tier 1 — Developer
+  // Dodaje se samo ako je folder upisan kod nekoga u Phone Directory.
+  // Ako nema developera za projekat, lanac počinje od team leada.
   if (developer) {
     chain.push({
       name: developer.name,
@@ -120,6 +455,9 @@ async function buildEscalationChain(channelId) {
   }
 
   // Tier 2 — Team Lead
+  // Telefon i ime se traže u Phone Directory po clickupId iz TEAM_LEADS.
+  // Ako clickupId nije upisan (null), phone ostaje null -> escalateCall
+  // preskoči ovaj nivo, ali ga svejedno dodajemo u lanac radi logovanja.
   if (teamLead) {
     const phone = teamLead.clickupId ? phoneMap[teamLead.clickupId] : null;
     const name = teamLead.clickupId ? nameMap[teamLead.clickupId] : teamLead.name;
@@ -132,6 +470,7 @@ async function buildEscalationChain(channelId) {
   }
 
   // Tier 3 — CTO
+  // Uvek se dodaje, bez uslova — poslednja instanca za svaki projekat.
   const ctoPhone = cto.clickupId ? phoneMap[cto.clickupId] : null;
   const ctoName = cto.clickupId ? nameMap[cto.clickupId] : cto.name;
   chain.push({
@@ -141,13 +480,34 @@ async function buildEscalationChain(channelId) {
     tier: 3,
   });
 
+  // Ovaj log je "zlatni" za debug — pokazuje tačno koga će sistem zvati i
+  // ko nema telefon (phone: null).
   console.log("✅ Final escalation chain:", JSON.stringify(chain));
-  return { chain, folderId };
+  return { chain, folderId, listId };
 }
 
+// -----------------------------------------------------------------------------
+//  escalateCall(incidentId, tierIndex)
+// -----------------------------------------------------------------------------
+//  Zove osobu na poziciji `tierIndex` u lancu. Rekurzivna je: svaki način na
+//  koji poziv "ne uspe" poziva samu sebe sa tierIndex + 1.
+//
+//  Tri načina da se eskalira na sledeći nivo:
+//    1. osoba nema telefon               -> odmah, bez zvonjave
+//    2. Twilio odbije poziv (greška)     -> odmah
+//    3. ne javi se / odbije / ne pritisne 1 u 2 minuta -> preko timera ispod
+//       (+ /twilio/status hvata no-answer / busy / failed i pre isteka timera)
+//
+//  Lanac se zaustavlja kad tierIndex pređe dužinu lanca — tada NIKO nije
+//  potvrdio i u logu ostaje "All tiers called, no one answered!".
+//  ⚠️ Taj slučaj se trenutno NE javlja nikome u Slack — ako se traži takva
+//     "nobody answered" poruka, dodaje se upravo na to mesto.
+// -----------------------------------------------------------------------------
 async function escalateCall(incidentId, tierIndex = 0) {
   const incident = activeIncidents[incidentId];
   if (!incident) {
+    // Najčešći uzrok: servis je restartovan/redeployovan dok je incident bio
+    // aktivan, pa je in-memory zapis izgubljen (vidi activeIncidents gore).
     console.error(`❌ Incident ${incidentId} not found!`);
     return;
   }
@@ -162,6 +522,8 @@ async function escalateCall(incidentId, tierIndex = 0) {
   const person = chain[tierIndex];
   const tierName = `Tier ${person.tier}`;
 
+  // Nema broja u Phone Directory -> preskoči nivo (ovo je ono "ukoliko nema
+  // broj za tu osobu ovaj korak se preskače" iz specifikacije).
   if (!person.phone) {
     console.error(`❌ ${person.name} has no phone number in Phone Directory!`);
     escalateCall(incidentId, tierIndex + 1);
@@ -174,9 +536,13 @@ async function escalateCall(incidentId, tierIndex = 0) {
     const call = await twilioClient.calls.create({
       to: person.phone,
       from: TWILIO_FROM_NUMBER,
+      // Twilio pozove OVAJ URL kad se poziv javi, da dobije šta da izgovori.
+      // incidentId i tier idu kao query da bismo znali kontekst u handleru.
       url: `${RAILWAY_URL}/twilio/voice?incidentId=${incidentId}&tier=${tierIndex}`,
+      // Twilio ovde javlja ISHOD poziva (javljeno / ne javlja se / zauzeto).
       statusCallback: `${RAILWAY_URL}/twilio/status?incidentId=${incidentId}&tier=${tierIndex}`,
       statusCallbackEvent: ["completed", "no-answer", "busy", "failed"],
+      // Koliko sekundi zvoni pre nego što Twilio odustane (no-answer).
       timeout: 30,
     });
 
@@ -184,6 +550,13 @@ async function escalateCall(incidentId, tierIndex = 0) {
     activeIncidents[incidentId].callSid = call.sid;
     activeIncidents[incidentId].currentTier = tierIndex;
 
+    // ⚠️ SIGURNOSNI TIMER: 120000 ms = 2 minuta.
+    //    Pokriva slučaj kad se čovek javi ali NE pritisne 1 (npr. javio se
+    //    pa prekinuo, ili je poziv otišao na govornu poštu koja "prihvati"
+    //    poziv). Bez ovoga bi lanac stao na tom nivou.
+    //    Ako menjaš ovu vrednost: mora biti veća od `timeout: 30` iznad,
+    //    inače eskalira dok telefon još zvoni.
+    //    Timer se briše (clearTimeout) na potvrdu u /twilio/gather.
     activeIncidents[incidentId].escalationTimer = setTimeout(() => {
       if (!activeIncidents[incidentId]?.acknowledged) {
         console.log(`⏰ ${tierName} did not confirm, escalating...`);
@@ -192,11 +565,30 @@ async function escalateCall(incidentId, tierIndex = 0) {
     }, 120000);
 
   } catch (err) {
+    // Npr. nevažeći broj, nepokriven region, potrošen Twilio kredit.
     console.error(`❌ Twilio error for ${tierName}:`, err.message);
     escalateCall(incidentId, tierIndex + 1);
   }
 }
 
+// =============================================================================
+//  TWILIO WEBHOOK ENDPOINTS
+//  ⚠️ Ova tri endpointa ne poziva čovek nego Twilio. URL-ovi se grade iz
+//     RAILWAY_URL u escalateCall — ako preimenuješ rute, promeni ih i tamo.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+//  POST/GET /twilio/voice — šta se izgovara kad se osoba javi
+// -----------------------------------------------------------------------------
+//  Vraća TwiML (XML) koji Twilio "odigra" na liniji.
+//  <Gather numDigits="1"> čeka jedan taster i onda poziva /twilio/gather.
+//
+//  ⚠️ Tekst je na engleskom (voice="alice", language="en-US") i čita se
+//     naglas — uključujući OPIS koji je klijent uneo u Slack formu.
+//  ⚠️ U TwiML-u & mora biti escape-ovan kao &amp; (zato "&amp;tier=") —
+//     inače Twilio ne uspe da parsira XML i poziv se prekine.
+//  ⚠️ app.all (ne app.post) je namerno: Twilio zna da pogodi i GET-om.
+// -----------------------------------------------------------------------------
 app.all("/twilio/voice", (req, res) => {
   const { incidentId, tier } = req.query;
   const incident = activeIncidents[incidentId];
@@ -204,6 +596,8 @@ app.all("/twilio/voice", (req, res) => {
   const person = chain?.[parseInt(tier)];
   const tierName = person ? `Tier ${person.tier}` : `Tier ${parseInt(tier) + 1}`;
 
+  // Fallback vrednosti postoje da poziv ne bi pukao ako je incident izgubljen
+  // iz memorije (restart) — čovek će čuti "Unknown" umesto tišine.
   const severity = incident?.severity || "Unknown";
   const type = incident?.type || "Unknown";
   const description = incident?.description || "No description";
@@ -214,41 +608,66 @@ app.all("/twilio/voice", (req, res) => {
   res.send(twiml);
 });
 
+// -----------------------------------------------------------------------------
+//  POST/GET /twilio/gather — obrada pritisnutog tastera
+// -----------------------------------------------------------------------------
+//  OVO JE NAJVAŽNIJI DEO FLOW-A: pritisak na "1" = preuzimanje incidenta.
+//  Kad se to desi, redom:
+//    1. incident se markira kao acknowledged i timer se otkazuje
+//       (time se zaustavlja dalja eskalacija)
+//    2. napravi se ClickUp task (ranije je ovo radio Make)
+//    3. u Slack ide potvrda + link ka tasku
+//    4. čoveku na liniji se izgovori "thank you"
+//
+//  Bilo koji drugi taster (ili ništa) -> eskalacija na sledeći nivo.
+// -----------------------------------------------------------------------------
 app.all("/twilio/gather", async (req, res) => {
   const { incidentId, tier } = req.query;
+  // Twilio pošalje Digits u body-ju (POST); query je fallback za GET.
   const digit = req.body?.Digits || req.query?.Digits;
   const incident = activeIncidents[incidentId];
   const chain = incident?.escalationChain;
+  // person = ko je javio se na ovom nivou; on postaje assignee taska.
   const person = chain?.[parseInt(tier)];
 
   if (digit === "1" && incident) {
+    // Ovaj flag gasi i timer proveru i /twilio/status eskalaciju.
     incident.acknowledged = true;
     clearTimeout(incident.escalationTimer);
 
     console.log(`✅ Incident ${incidentId}: ${person?.name} acknowledged!`);
 
-    // Šalji webhook na Make
-    if (MAKE_WEBHOOK_URL) {
-      try {
-        await axios.post(MAKE_WEBHOOK_URL, {
-          incident_id: incidentId,
-          list_id: incident.listId,
-          description: incident.description,
-          assignee_clickup_id: person?.clickupId || null,
-        });
-        console.log(`✅ Make webhook sent for incident ${incidentId}`);
-      } catch (err) {
-        console.error("❌ Error sending Make webhook:", err.message);
-      }
+    // Napravi task direktno u ClickUp-u (bez Make-a)
+    // ⚠️ Greška se hvata i SAMO loguje — namerno. Ako ClickUp padne, poziv
+    //    ostaje potvrđen i eskalacija se ne nastavlja (ne želimo da budimo
+    //    CTO-a zato što je ClickUp API imao 500). Task se u tom slučaju
+    //    pravi ručno; u Slack poruci tada nema linka ka tasku.
+    let taskUrl = null;
+    try {
+      const task = await createClickUpTask(incident, person);
+      taskUrl = task?.url || null;
+      incident.clickupTaskId = task?.id || null;
+    } catch (err) {
+      console.error(
+        "❌ Error creating ClickUp task:",
+        err.response?.data || err.message
+      );
     }
 
     // Slack poruka
+    // ⚠️ "#inc-client-test" je fallback kanal ako incident nema sačuvan
+    //    channel ID — koristan u testu, u produkciji se praktično ne pogađa.
     try {
       await axios.post(
         "https://slack.com/api/chat.postMessage",
         {
           channel: incident.channel || "#inc-client-test",
-          text: `✅ *Incident acknowledged!*\n*Incident ID:* ${incidentId}\n*Status:* 🟡 In Progress`,
+          text:
+            `✅ *Incident acknowledged!*\n` +
+            `*Incident ID:* ${incidentId}\n` +
+            `*Acknowledged by:* ${person?.name || "N/A"}\n` +
+            `*Status:* 🟡 In Progress` +
+            (taskUrl ? `\n*ClickUp task:* ${taskUrl}` : ``),
         },
         {
           headers: {
@@ -265,6 +684,8 @@ app.all("/twilio/gather", async (req, res) => {
     res.type("text/xml");
     res.send(twiml);
   } else {
+    // Pogrešan taster: prvo odgovori Twiliju (da se poruka izgovori), pa
+    // onda pokreni sledeći nivo.
     const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">Invalid input. Escalating to next tier.</Say></Response>`;
     res.type("text/xml");
     res.send(twiml);
@@ -272,6 +693,16 @@ app.all("/twilio/gather", async (req, res) => {
   }
 });
 
+// -----------------------------------------------------------------------------
+//  POST /twilio/status — ishod poziva (Twilio status callback)
+// -----------------------------------------------------------------------------
+//  Ovo je "brzi put" za eskalaciju: kad Twilio javi da se čovek NIJE javio,
+//  da je zauzet ili da je poziv pao, ne čekamo 2-minutni timer nego odmah
+//  zovemo sledećeg.
+//  ⚠️ Uslov !incident?.acknowledged je bitan: status "completed" dolazi i
+//     posle USPEŠNE potvrde, i bez te provere bi sistem zvao sledeći nivo
+//     iako je incident već preuzet.
+// -----------------------------------------------------------------------------
 app.post("/twilio/status", (req, res) => {
   const { incidentId, tier } = req.query;
   const callStatus = req.body.CallStatus;
@@ -289,9 +720,37 @@ app.post("/twilio/status", (req, res) => {
     escalateCall(incidentId, parseInt(tier) + 1);
   }
 
+  // Twilio-u je dovoljan 200 — telo odgovora ga ne zanima.
   res.status(200).send();
 });
 
+// =============================================================================
+//  SLACK ENDPOINTS
+//  ⚠️ Oba URL-a se podešavaju u Slack App konfiguraciji (api.slack.com):
+//     /slack/command      -> Slash Commands -> Request URL
+//     /slack/interactions  -> Interactivity & Shortcuts -> Request URL
+//     Ako se promeni RAILWAY_URL, OVA DVA URL-A SE MORAJU RUČNO PROMENITI
+//     u Slack app-u — inače forma prestane da se otvara.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+//  POST /slack/command — otvara modal formu za prijavu incidenta
+// -----------------------------------------------------------------------------
+//  Slack zahteva odgovor u roku od 3 sekunde, zato se prvo pošalje 200
+//  (res.status(200).send()) a modal se otvara posle, preko views.open.
+//
+//  ⚠️ RUČNO — OPCIJE U FORMI SU HARDKODOVANE OVDE:
+//     - Severity: P1 / P2 / P3
+//       `value` mora da postoji u PRIORITY_MAP (gore), inače ClickUp
+//       priority tiho padne na Normal.
+//     - Incident Type: Layout / JS / Forms
+//       Slobodno se dodaju nove opcije, nigde drugo se ne proverava —
+//       vrednost se samo prepisuje u ime i opis taska.
+//
+//  ⚠️ private_metadata: channel_id — OVAKO se pamti iz kog je kanala forma
+//     pokrenuta. To je jedini način da posle znamo koji je projekat
+//     (Slack ne šalje kanal u view_submission payloadu). NE dirati.
+// -----------------------------------------------------------------------------
 app.post("/slack/command", async (req, res) => {
   const { trigger_id, channel_id } = req.body;
   res.status(200).send();
@@ -300,6 +759,7 @@ app.post("/slack/command", async (req, res) => {
     await axios.post(
       "https://slack.com/api/views.open",
       {
+        // trigger_id važi samo ~3 sekunde od komande.
         trigger_id,
         view: {
           type: "modal",
@@ -309,6 +769,9 @@ app.post("/slack/command", async (req, res) => {
           submit: { type: "plain_text", text: "Submit" },
           close: { type: "plain_text", text: "Cancel" },
           blocks: [
+            // ⚠️ block_id i action_id se čitaju u /slack/interactions
+            //    (values.severity_block.severity_action...). Ako ih
+            //    preimenuješ ovde, MORAŠ i tamo — inače submit pukne.
             {
               type: "input",
               block_id: "severity_block",
@@ -358,21 +821,40 @@ app.post("/slack/command", async (req, res) => {
       }
     );
   } catch (err) {
+    // Najčešće: istekao trigger_id ili token bez scope-a.
     console.error("Error opening modal:", err.response?.data || err.message);
   }
 });
 
+// -----------------------------------------------------------------------------
+//  POST /slack/interactions — submit forme, POČETAK INCIDENTA
+// -----------------------------------------------------------------------------
+//  Ovde se incident rađa: pročitaju se polja forme, izgradi se eskalacioni
+//  lanac, incident se upiše u memoriju, pošalje se Slack najava i krene
+//  prvi poziv.
+//
+//  ⚠️ Slack šalje payload kao STRING unutar form polja "payload" — zato
+//     JSON.parse. Nije JSON body.
+//  ⚠️ Odgovor { response_action: "clear" } zatvara modal. Mora da stigne
+//     brzo, zato se šalje PRE Slack poruke i poziva.
+// -----------------------------------------------------------------------------
 app.post("/slack/interactions", async (req, res) => {
   const payload = JSON.parse(req.body.payload);
 
   if (payload.type === "view_submission") {
+    // ⚠️ Putevi ispod moraju da odgovaraju block_id/action_id iz
+    //    /slack/command modala.
     const values = payload.view.state.values;
     const severity = values.severity_block.severity_action.selected_option.value;
     const type = values.type_block.type_action.selected_option.value;
     const description = values.desc_block.desc_action.value;
     const user = payload.user.name;
+    // Kanal iz koga je forma pokrenuta (upisan u private_metadata) —
+    // ovo je ključ za mapiranje na ClickUp projekat.
     const channel = payload.view.private_metadata;
 
+    // ID incidenta = INC- + timestamp u ms. Jedinstven je u praksi i koristi
+    // se kao ključ u activeIncidents i u query-jima ka Twiliju.
     const incidentId = `INC-${Date.now()}`;
     const result = await buildEscalationChain(channel);
 
@@ -383,15 +865,22 @@ app.post("/slack/interactions", async (req, res) => {
       description,
       user,
       channel,
+      // Postaje true kad neko pritisne 1; gasi svaku dalju eskalaciju.
       acknowledged: false,
       escalationChain: result?.chain || null,
-      listId: "901414563380",
+      // Razrešena ClickUp lista (po folderu projekta). Poslednji fallback je
+      // env CLICKUP_DEFAULT_LIST_ID — ako je i to prazno, task se ne pravi.
+      listId: result?.listId || process.env.CLICKUP_DEFAULT_LIST_ID || null,
       folderId: result?.folderId || null,
       createdAt: new Date().toISOString(),
     };
 
+    // Zatvori modal odmah (Slack ima kratak timeout).
     res.json({ response_action: "clear" });
 
+    // Najava u kanalu — ide UVEK, čak i ako lanac ne postoji.
+    // ⚠️ Zato prisustvo ove poruke NIJE dokaz da su pozivi krenuli;
+    //    za to gledaj log.
     try {
       await axios.post(
         "https://slack.com/api/chat.postMessage",
@@ -410,22 +899,28 @@ app.post("/slack/interactions", async (req, res) => {
       console.error("Error posting to Slack:", err.response?.data || err.message);
     }
 
+    // Kreni od nivoa 0 (Tier 1). Namerno BEZ await — poziv i eskalacija
+    // traju minutima, a HTTP odgovor je već poslat.
     if (result?.chain && result.chain.length > 0) {
       escalateCall(incidentId, 0);
     } else {
+      // Najčešći uzrok: kanal nije mapiran na folder (vidi RUČNO (A)).
       console.error(`❌ Incident ${incidentId}: No escalation chain for channel ${channel}`);
     }
 
     return;
   }
 
+  // Ostali tipovi interakcija (klik na dugme i sl.) se trenutno ne koriste.
   res.status(200).send();
 });
 
+// Health check — Railway ga koristi da proveri da li servis živi.
 app.get("/", (req, res) => {
   res.status(200).send("Server is healthy ✅");
 });
 
+// ⚠️ Railway sam dodeljuje PORT preko env varijable — ne hardkoduj ga.
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
