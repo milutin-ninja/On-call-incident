@@ -15,10 +15,13 @@
 //     i link se postuje u Slack.                        [POST /twilio/gather]
 //
 //  ESKALACIONI LANAC (3 nivoa):
-//    Tier 1 = developer zadužen za projekat (iz Phone Directory dokumenta)
+//    Tier 1 = SVI developeri zaduženi za projekat (iz Phone Directory dok.)
+//             Može ih biti 2+; redosled među njima nije bitan.
 //    Tier 2 = team lead njegovog ClickUp Space-a (iz TEAM_LEADS niže)
 //    Tier 3 = CTO (iz CTO konstante niže)
 //  Ako neko nema broj telefona, taj nivo se preskače (ne prekida se lanac).
+//  Ako NIKO iz celog lanca ne potvrdi, ceo krug se PONAVLJA od početka
+//  (vidi scheduleNextRound) dok neko ne pritisne 1.
 //
 // -----------------------------------------------------------------------------
 //  ⚠️  ŠTA SE ODRŽAVA RUČNO — pročitaj ovo pre nego što diraš bilo šta
@@ -33,6 +36,16 @@
 //  (C) TEAM_LEADS konstanta u ovom fajlu.              [vidi TEAM_LEADS]
 //  (D) Lista "Incidents" unutar svakog projektnog foldera u ClickUp-u.
 //                                                      [vidi resolveListId]
+//
+//  ⚠️ SLACK APP SCOPE-OVI: chat:write, commands, files:read
+//     `files:read` je OBAVEZAN — bez njega upload videa/screenshotova u
+//     formi radi, ali skidanje fajla pada i task ostane bez priloga.
+//
+//  ⚠️ OPCIONE ENV VARIJABLE (imaju razumne default vrednosti):
+//     CLICKUP_INCIDENT_LIST_NAME  ime liste u folderu (default "Incidents")
+//     CLICKUP_DEFAULT_LIST_ID     rezervna lista ako folder nema svoju
+//     INCIDENT_ROUND_PAUSE_MS     pauza između krugova poziva (default 5 min)
+//     INCIDENT_MAX_ROUNDS         limit krugova (default 0 = neograničeno)
 // =============================================================================
 
 import express from "express";
@@ -168,7 +181,7 @@ const activeIncidents = {};
 //  Vraća tri mape:
 //    phoneMap[clickupId] -> telefon        (za TEAM_LEADS i CTO)
 //    nameMap[clickupId]  -> ime i prezime  (za TEAM_LEADS i CTO)
-//    folderMap[folderId] -> developer      (za Tier 1, po projektu)
+//    folderMap[folderId] -> NIZ developera (za Tier 1, po projektu)
 //
 //  Ako čitanje padne, vraća prazne mape — lanac tada ostane bez telefona i
 //  incident prođe bez poziva, pa greška "❌ Error reading Phone Directory"
@@ -208,11 +221,13 @@ async function getPhoneDirectory() {
           const clickupId = match[1];
           phoneMap[clickupId] = phone;
           nameMap[clickupId] = fullName;
-          // ⚠️ Ako su dva čoveka upisana na ISTI folder, poslednji red u
-          //    tabeli pobeđuje (prepisuje prethodnog) — jedan folder ima
-          //    tačno jednog Tier 1 developera.
+          // Jedan folder MOŽE imati više developera — svi se skupljaju u
+          // niz i svi postaju Tier 1 (redosled nije bitan, vidi
+          // buildEscalationChain). Upiši istog Folder ID kod više ljudi
+          // u Phone Directory tabeli i svi će biti zvani u prvom krugu.
           for (const folderId of folderIds) {
-            folderMap[folderId] = { clickupId, phone, name: fullName };
+            if (!folderMap[folderId]) folderMap[folderId] = [];
+            folderMap[folderId].push({ clickupId, phone, name: fullName });
           }
         }
       }
@@ -308,6 +323,71 @@ function resolveListId(lists, folderId) {
 const PRIORITY_MAP = { P1: 1, P2: 2, P3: 3 };
 
 // -----------------------------------------------------------------------------
+//  FAJLOVI IZ SLACK FORME (video zapis + screenshotovi)
+// -----------------------------------------------------------------------------
+//  ⚠️ ZAŠTO OVO NIJE SAMO LINK U OPISU:
+//     Fajlovi koje klijent uploaduje kroz Slack modal su PRIVATNI. Njihov
+//     `url_private` link zahteva Slack token, pa ga ClickUp ne može otvoriti
+//     ni prikazati — u opisu taska bi bila mrtva slika / mrtav link za svakoga
+//     kome se task otvori bez Slack sesije.
+//     Zato radimo dva koraka:
+//       1. fajl se skine sa Slacka (sa bot tokenom) i UPLOADUJE na ClickUp task
+//          kao pravi attachment -> vidljiv svima na tasku, trajno
+//       2. u opis taska ide Slack permalink (koristan timu koji je u Slacku)
+//
+//  ⚠️ SLACK SCOPE: `file_input` element i skidanje fajlova zahtevaju
+//     `files:read` scope na Slack app-u. Bez njega upload u formi radi ali
+//     skidanje pada sa 403, i task ostane bez priloga (vidi log).
+//  ⚠️ LIMITI: Slack file_input do 100 MB po fajlu; ClickUp attachment do 1 GB.
+//  ⚠️ Zahteva Node 18+ (koristi globalni FormData i Blob). Railway to ima.
+// -----------------------------------------------------------------------------
+
+// Skida sadržaj jednog Slack fajla kao Buffer.
+async function downloadSlackFile(file) {
+  const url = file.url_private_download || file.url_private;
+  const response = await axios.get(url, {
+    headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+    responseType: "arraybuffer",
+  });
+  return Buffer.from(response.data);
+}
+
+// Prebacuje listu Slack fajlova na ClickUp task kao attachmente.
+// Nikad ne baca grešku — task je važniji od priloga, pa se neuspeli fajl
+// samo loguje i preskoči.
+async function attachFilesToClickUpTask(taskId, files) {
+  if (!taskId || !files || files.length === 0) return;
+
+  for (const file of files) {
+    try {
+      const buffer = await downloadSlackFile(file);
+      const form = new FormData();
+      // ClickUp očekuje polje "attachment" u multipart/form-data zahtevu.
+      // Content-Type sa boundary axios postavlja sam kad mu se da FormData —
+      // NE postavljaj ga ručno, inače boundary fali i ClickUp vrati grešku.
+      form.append(
+        "attachment",
+        new Blob([buffer], { type: file.mimetype || "application/octet-stream" }),
+        file.name || "attachment"
+      );
+
+      await axios.post(
+        `https://api.clickup.com/api/v2/task/${taskId}/attachment`,
+        form,
+        { headers: { Authorization: CLICKUP_API_KEY } }
+      );
+
+      console.log(`📎 Attached to task ${taskId}: ${file.name}`);
+    } catch (err) {
+      console.error(
+        `❌ Error attaching file "${file.name}" to task ${taskId}:`,
+        err.response?.data || err.message
+      );
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
 //  createClickUpTask(incident, person)
 // -----------------------------------------------------------------------------
 //  Pravi task u ClickUp-u. Poziva se SAMO kad neko potvrdi poziv sa "1".
@@ -327,7 +407,7 @@ async function createClickUpTask(incident, person) {
 
   // Opis taska. `markdown_description` (ne `description`) je ClickUp polje
   // koje renderuje markdown — zato **bold** radi.
-  const markdown_description = [
+  const lines = [
     `**Incident ID:** ${incident.id}`,
     `**Severity:** ${incident.severity}`,
     `**Type:** ${incident.type}`,
@@ -337,10 +417,35 @@ async function createClickUpTask(incident, person) {
     ``,
     `**Description:**`,
     incident.description || "No description",
-  ].join("\n");
+  ];
+
+  // Video zapis (opciono). Permalink je koristan timu u Slacku; sam fajl se
+  // posle dodaje kao attachment na task (vidi attachFilesToClickUpTask).
+  if (incident.videoFiles?.length > 0) {
+    lines.push(``, `**Video record:**`);
+    for (const f of incident.videoFiles) {
+      lines.push(`- [${f.name || "video"}](${f.permalink})`);
+    }
+  }
+
+  // Screenshotovi (opciono, može ih biti više).
+  if (incident.screenshotFiles?.length > 0) {
+    lines.push(``, `**Screenshots (${incident.screenshotFiles.length}):**`);
+    for (const f of incident.screenshotFiles) {
+      lines.push(`- [${f.name || "screenshot"}](${f.permalink})`);
+    }
+  }
+
+  if (incident.videoFiles?.length > 0 || incident.screenshotFiles?.length > 0) {
+    lines.push(``, `_Fajlovi su dodati i kao prilozi na ovaj task._`);
+  }
+
+  const markdown_description = lines.join("\n");
 
   const body = {
-    name: `[${incident.severity}] ${incident.type} — ${incident.id}`,
+    // Ime taska = "Incident name" koje je klijent uneo u formu.
+    // Fallback postoji samo za slučaj da polje nekako dođe prazno.
+    name: incident.name || `[${incident.severity}] ${incident.type} — ${incident.id}`,
     markdown_description,
     priority,
   };
@@ -427,8 +532,9 @@ async function buildEscalationChain(channelId) {
   // dokumentu odmah stupa na snagu, bez redeploya.
   const { phoneMap, folderMap, nameMap } = await getPhoneDirectory();
 
-  const developer = folderMap[folderId];
-  console.log(`👤 Developer for folder ${folderId}:`, developer);
+  // Svi developeri upisani na ovaj folder (može ih biti 2+).
+  const developers = folderMap[folderId] || [];
+  console.log(`👤 Developers for folder ${folderId} (${developers.length}):`, developers);
 
   const { spaceName, lists } = await getFolderInfo(folderId);
   console.log("🏢 Space:", spaceName);
@@ -442,10 +548,12 @@ async function buildEscalationChain(channelId) {
   const cto = CTO;
   const chain = [];
 
-  // Tier 1 — Developer
-  // Dodaje se samo ako je folder upisan kod nekoga u Phone Directory.
-  // Ako nema developera za projekat, lanac počinje od team leada.
-  if (developer) {
+  // Tier 1 — Developeri (može ih biti više)
+  // Redosled unutar Tier 1 NIJE bitan — zovu se jedan po jedan, u onom
+  // redosledu u kom su upisani u Phone Directory tabeli. Bitno je samo da
+  // SVI developeri prođu pre nego što se pređe na team leada.
+  // Ako nema ni jednog developera za projekat, lanac počinje od team leada.
+  for (const developer of developers) {
     chain.push({
       name: developer.name,
       phone: developer.phone,
@@ -498,11 +606,143 @@ async function buildEscalationChain(channelId) {
 //    3. ne javi se / odbije / ne pritisne 1 u 2 minuta -> preko timera ispod
 //       (+ /twilio/status hvata no-answer / busy / failed i pre isteka timera)
 //
-//  Lanac se zaustavlja kad tierIndex pređe dužinu lanca — tada NIKO nije
-//  potvrdio i u logu ostaje "All tiers called, no one answered!".
-//  ⚠️ Taj slučaj se trenutno NE javlja nikome u Slack — ako se traži takva
-//     "nobody answered" poruka, dodaje se upravo na to mesto.
+//  Lanac se "istroši" kad tierIndex pređe dužinu lanca — tada niko nije
+//  potvrdio u ovom krugu, pa scheduleNextRound zakazuje PONOVNI krug od
+//  Tier 1. Tako se zvonjava ponavlja dok neko ne pritisne 1.
+//  Log "Tier X did not confirm" + "ceo lanac je pozvan bez potvrde" su
+//  normalni koraci, ne greške.
 // -----------------------------------------------------------------------------
+//  postToSlack(channel, text)
+// -----------------------------------------------------------------------------
+//  Mali helper za poruke u Slack. Nikad ne baca grešku — ako Slack padne,
+//  samo se loguje, jer nijedan Slack problem ne sme da prekine tok incidenta.
+//
+//  ⚠️ Slack chat.postMessage na grešku vraća HTTP 200 sa telom
+//     { ok: false, error: "..." } — axios to NE tretira kao grešku i catch se
+//     ne aktivira. Zato se `ok` proverava ručno; bez toga bi poruke tiho
+//     padale (npr. channel_not_found, not_in_channel, invalid_auth) a u logu
+//     ne bi bilo ničega.
+//
+//  ⚠️ Nema fallback kanala. Ako channel nije poznat, poruka se NE šalje nego
+//     se loguje — slanje u hardkodovan kanal je nekad išlo na "#inc-client-test",
+//     ali takav kanal može biti obrisan/preimenovan i poruka bi otišla u prazno.
+//     Opciono: postavi env INCIDENT_FALLBACK_CHANNEL (ID kanala) da poruke bez
+//     poznatog kanala imaju gde da padnu.
+// -----------------------------------------------------------------------------
+async function postToSlack(channel, text) {
+  const target = channel || process.env.INCIDENT_FALLBACK_CHANNEL;
+
+  if (!target) {
+    console.error("❌ postToSlack: nepoznat kanal, poruka nije poslata:", text);
+    return;
+  }
+
+  try {
+    const response = await axios.post(
+      "https://slack.com/api/chat.postMessage",
+      { channel: target, text },
+      {
+        headers: {
+          Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    if (!response.data?.ok) {
+      console.error(
+        `❌ Slack odbio poruku za kanal ${target}:`,
+        response.data?.error
+      );
+    }
+  } catch (err) {
+    console.error("Error posting to Slack:", err.response?.data || err.message);
+  }
+}
+
+// -----------------------------------------------------------------------------
+//  scheduleNextRound(incidentId)
+// -----------------------------------------------------------------------------
+//  Poziva se kad ceo lanac (svi developeri + team lead + CTO) prođe a NIKO
+//  nije pritisnuo 1. Zakazuje NOVI KRUG od početka lanca.
+//
+//  Ponavlja se dok neko ne potvrdi — to je i bila namera: incident ne sme
+//  da "propadne" u tišini.
+//
+//  Podešavanja (Railway env, oba opciona):
+//    INCIDENT_ROUND_PAUSE_MS  pauza između krugova u ms. Default 300000 (5 min).
+//                             ⚠️ Ne stavljaj premalo — bez pauze ljudima zvoni
+//                             telefon bez prestanka i Twilio račun raste.
+//    INCIDENT_MAX_ROUNDS      maksimalan broj krugova. Default 0 = NEOGRANIČENO
+//                             (zvoni dok se neko ne javi).
+//                             ⚠️ Preporuka: postavi neku vrednost (npr. 10).
+//                             Sa 0, zaboravljen TEST incident zvoni ljude u
+//                             krug dok se servis ne restartuje.
+//
+//  ⚠️ BEZBEDNOSNA PROVERA: ako NIKO u lancu nema telefon, krugovi se NE
+//     ponavljaju. Bez ovoga bi se sistem vrtio zauvek u prazno (svaki nivo se
+//     preskoči -> lanac se istroši -> novi krug -> isto), trošeći log i
+//     ne zoveći nikoga. U tom slučaju ide glasan alarm u Slack.
+// -----------------------------------------------------------------------------
+function scheduleNextRound(incidentId) {
+  const incident = activeIncidents[incidentId];
+  if (!incident || incident.acknowledged) return;
+
+  const chain = incident.escalationChain || [];
+
+  // Ako niko nema broj, ponavljanje je besmisleno — prekini i javi.
+  if (!chain.some(p => p.phone)) {
+    console.error(
+      `❌ Incident ${incidentId}: NIKO u lancu nema telefon — prekidam ponavljanje!`
+    );
+    postToSlack(
+      incident.channel,
+      `🆘 *Incident ${incidentId} — NIKO NIJE POZVAN*\n` +
+        `Nijedna osoba u eskalacionom lancu nema broj telefona u Phone Directory dokumentu.\n` +
+        `Ponavljanje je zaustavljeno. *Reagujte ručno.*`
+    );
+    return;
+  }
+
+  const maxRounds = parseInt(process.env.INCIDENT_MAX_ROUNDS || "0", 10);
+  const pauseMs = parseInt(process.env.INCIDENT_ROUND_PAUSE_MS || "300000", 10);
+
+  incident.round = (incident.round || 1) + 1;
+
+  // maxRounds = 0 znači neograničeno, pa se ovaj uslov nikad ne aktivira.
+  if (maxRounds > 0 && incident.round > maxRounds) {
+    console.error(
+      `❌ Incident ${incidentId}: dostignut limit od ${maxRounds} krugova, prekidam.`
+    );
+    postToSlack(
+      incident.channel,
+      `🆘 *Incident ${incidentId} — NIKO SE NIJE JAVIO*\n` +
+        `Prošlo je ${maxRounds} krugova poziva bez potvrde. Ponavljanje je zaustavljeno.\n` +
+        `*Reagujte ručno.*`
+    );
+    return;
+  }
+
+  const pauseMin = Math.round(pauseMs / 60000);
+  console.log(
+    `🔁 Incident ${incidentId}: krug ${incident.round - 1} bez potvrde. ` +
+      `Krug ${incident.round} počinje za ${pauseMs} ms.`
+  );
+
+  postToSlack(
+    incident.channel,
+    `🔁 *Incident ${incidentId} — niko se nije javio*\n` +
+      `Ponavljam pozive od početka (krug ${incident.round}) za ~${pauseMin} min.`
+  );
+
+  // Timer se pamti na incidentu da bi se otkazao na potvrdu (u /twilio/gather).
+  incident.roundTimer = setTimeout(() => {
+    if (!activeIncidents[incidentId]?.acknowledged) {
+      escalateCall(incidentId, 0);
+    }
+  }, pauseMs);
+}
+
 async function escalateCall(incidentId, tierIndex = 0) {
   const incident = activeIncidents[incidentId];
   if (!incident) {
@@ -514,8 +754,13 @@ async function escalateCall(incidentId, tierIndex = 0) {
 
   const chain = incident.escalationChain;
 
+  // Lanac istrošen = niko u ovom krugu nije potvrdio -> zakaži NOVI KRUG
+  // od početka (Tier 1). Ovo je ono "ponavljati proces ispočetka".
   if (!chain || tierIndex >= chain.length) {
-    console.error(`❌ Incident ${incidentId}: All tiers called, no one answered!`);
+    console.log(
+      `⚠️ Incident ${incidentId}: ceo lanac je pozvan bez potvrde (krug ${incident.round || 1}).`
+    );
+    scheduleNextRound(incidentId);
     return;
   }
 
@@ -601,8 +846,9 @@ app.all("/twilio/voice", (req, res) => {
   const severity = incident?.severity || "Unknown";
   const type = incident?.type || "Unknown";
   const description = incident?.description || "No description";
+  const name = incident?.name || "Unnamed incident";
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Gather numDigits="1" action="${RAILWAY_URL}/twilio/gather?incidentId=${incidentId}&amp;tier=${tier}" method="POST" timeout="10"><Say voice="alice" language="en-US">Alert. New incident reported. Severity ${severity}. Type ${type}. Description ${description}. This is ${tierName} escalation. Press 1 to acknowledge and take ownership of this incident.</Say></Gather><Say voice="alice">No input received. Escalating to next tier.</Say></Response>`;
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Gather numDigits="1" action="${RAILWAY_URL}/twilio/gather?incidentId=${incidentId}&amp;tier=${tier}" method="POST" timeout="10"><Say voice="alice" language="en-US">Alert. New incident reported. ${name}. Severity ${severity}. Type ${type}. Description ${description}. This is ${tierName} escalation. Press 1 to acknowledge and take ownership of this incident.</Say></Gather><Say voice="alice">No input received. Escalating to next tier.</Say></Response>`;
 
   res.type("text/xml");
   res.send(twiml);
@@ -634,6 +880,9 @@ app.all("/twilio/gather", async (req, res) => {
     // Ovaj flag gasi i timer proveru i /twilio/status eskalaciju.
     incident.acknowledged = true;
     clearTimeout(incident.escalationTimer);
+    // ⚠️ Bitno: otkazuje i zakazani NOVI KRUG poziva. Bez ovoga bi ljudima
+    //    ponovo zvonio telefon i posle uspešne potvrde.
+    clearTimeout(incident.roundTimer);
 
     console.log(`✅ Incident ${incidentId}: ${person?.name} acknowledged!`);
 
@@ -647,6 +896,13 @@ app.all("/twilio/gather", async (req, res) => {
       const task = await createClickUpTask(incident, person);
       taskUrl = task?.url || null;
       incident.clickupTaskId = task?.id || null;
+
+      // Prilozi (video + screenshotovi) se dodaju POSLE kreiranja taska,
+      // jer ClickUp attachment endpoint traži task ID.
+      await attachFilesToClickUpTask(incident.clickupTaskId, [
+        ...(incident.videoFiles || []),
+        ...(incident.screenshotFiles || []),
+      ]);
     } catch (err) {
       console.error(
         "❌ Error creating ClickUp task:",
@@ -655,30 +911,14 @@ app.all("/twilio/gather", async (req, res) => {
     }
 
     // Slack poruka
-    // ⚠️ "#inc-client-test" je fallback kanal ako incident nema sačuvan
-    //    channel ID — koristan u testu, u produkciji se praktično ne pogađa.
-    try {
-      await axios.post(
-        "https://slack.com/api/chat.postMessage",
-        {
-          channel: incident.channel || "#inc-client-test",
-          text:
-            `✅ *Incident acknowledged!*\n` +
-            `*Incident ID:* ${incidentId}\n` +
-            `*Acknowledged by:* ${person?.name || "N/A"}\n` +
-            `*Status:* 🟡 In Progress` +
-            (taskUrl ? `\n*ClickUp task:* ${taskUrl}` : ``),
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-            "Content-Type": "application/json",
-          },
-        }
-      );
-    } catch (err) {
-      console.error("Error posting to Slack:", err.message);
-    }
+    await postToSlack(
+      incident.channel,
+      `✅ *Incident acknowledged!*\n` +
+        `*Incident ID:* ${incidentId}\n` +
+        `*Acknowledged by:* ${person?.name || "N/A"}\n` +
+        `*Status:* 🟡 In Progress` +
+        (taskUrl ? `\n*ClickUp task:* ${taskUrl}` : ``)
+    );
 
     const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">Thank you. You have acknowledged the incident. Please check Slack for details. Good luck.</Say></Response>`;
     res.type("text/xml");
@@ -772,6 +1012,21 @@ app.post("/slack/command", async (req, res) => {
             // ⚠️ block_id i action_id se čitaju u /slack/interactions
             //    (values.severity_block.severity_action...). Ako ih
             //    preimenuješ ovde, MORAŠ i tamo — inače submit pukne.
+
+            // Ime incidenta -> postaje IME TASKA u ClickUp-u.
+            {
+              type: "input",
+              block_id: "name_block",
+              label: { type: "plain_text", text: "Incident name" },
+              element: {
+                type: "plain_text_input",
+                action_id: "name_action",
+                placeholder: {
+                  type: "plain_text",
+                  text: "npr. Kontakt forma ne šalje podatke",
+                },
+              },
+            },
             {
               type: "input",
               block_id: "severity_block",
@@ -810,6 +1065,35 @@ app.post("/slack/command", async (req, res) => {
                 multiline: true,
               },
             },
+
+            // ⚠️ file_input zahteva `files:read` scope na Slack app-u.
+            //    `optional: true` znači da klijent može da submituje bez fajla.
+            //    Limit je 100 MB po fajlu (Slack ograničenje).
+            {
+              type: "input",
+              block_id: "video_block",
+              optional: true,
+              label: { type: "plain_text", text: "Video record (optional)" },
+              element: {
+                type: "file_input",
+                action_id: "video_action",
+                filetypes: ["mp4", "mov", "webm", "avi", "mkv", "m4v"],
+                max_files: 1,
+              },
+            },
+            {
+              type: "input",
+              block_id: "shots_block",
+              optional: true,
+              label: { type: "plain_text", text: "Screenshots (optional)" },
+              element: {
+                type: "file_input",
+                action_id: "shots_action",
+                filetypes: ["png", "jpg", "jpeg", "gif", "webp", "heic"],
+                // Više screenshotova je podržano — podigni broj ako treba.
+                max_files: 10,
+              },
+            },
           ],
         },
       },
@@ -845,13 +1129,22 @@ app.post("/slack/interactions", async (req, res) => {
     // ⚠️ Putevi ispod moraju da odgovaraju block_id/action_id iz
     //    /slack/command modala.
     const values = payload.view.state.values;
+    const name = values.name_block.name_action.value;
     const severity = values.severity_block.severity_action.selected_option.value;
     const type = values.type_block.type_action.selected_option.value;
     const description = values.desc_block.desc_action.value;
+    // file_input vraća niz Slack file objekata u `.files`. Polja su opciona,
+    // pa kad klijent ne uploaduje ništa dobijamo prazan niz (ili undefined).
+    const videoFiles = values.video_block?.video_action?.files || [];
+    const screenshotFiles = values.shots_block?.shots_action?.files || [];
     const user = payload.user.name;
     // Kanal iz koga je forma pokrenuta (upisan u private_metadata) —
     // ovo je ključ za mapiranje na ClickUp projekat.
     const channel = payload.view.private_metadata;
+
+    console.log(
+      `📥 Incident submit: "${name}" | video: ${videoFiles.length} | screenshots: ${screenshotFiles.length}`
+    );
 
     // ID incidenta = INC- + timestamp u ms. Jedinstven je u praksi i koristi
     // se kao ključ u activeIncidents i u query-jima ka Twiliju.
@@ -860,13 +1153,20 @@ app.post("/slack/interactions", async (req, res) => {
 
     activeIncidents[incidentId] = {
       id: incidentId,
+      // Ime iz forme -> ime taska u ClickUp-u.
+      name,
       severity,
       type,
       description,
+      // Slack file objekti (id, name, mimetype, url_private, permalink...).
+      videoFiles,
+      screenshotFiles,
       user,
       channel,
       // Postaje true kad neko pritisne 1; gasi svaku dalju eskalaciju.
       acknowledged: false,
+      // Brojač krugova poziva (vidi scheduleNextRound). Prvi krug = 1.
+      round: 1,
       escalationChain: result?.chain || null,
       // Razrešena ClickUp lista (po folderu projekta). Poslednji fallback je
       // env CLICKUP_DEFAULT_LIST_ID — ako je i to prazno, task se ne pravi.
@@ -881,23 +1181,24 @@ app.post("/slack/interactions", async (req, res) => {
     // Najava u kanalu — ide UVEK, čak i ako lanac ne postoji.
     // ⚠️ Zato prisustvo ove poruke NIJE dokaz da su pozivi krenuli;
     //    za to gledaj log.
-    try {
-      await axios.post(
-        "https://slack.com/api/chat.postMessage",
-        {
-          channel: channel || "#inc-client-test",
-          text: `🚨 *New Incident — ${incidentId}*\n*Severity:* ${severity}\n*Type:* ${type}\n*Reported by:* @${user}\n*Description:* ${description}\n\n_Initiating call escalation..._`,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-            "Content-Type": "application/json",
-          },
-        }
-      );
-    } catch (err) {
-      console.error("Error posting to Slack:", err.response?.data || err.message);
-    }
+    const fileNote = [
+      videoFiles.length > 0 ? `🎥 ${videoFiles.length} video` : null,
+      screenshotFiles.length > 0 ? `🖼️ ${screenshotFiles.length} screenshot(a)` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
+    await postToSlack(
+      channel,
+      `🚨 *New Incident — ${incidentId}*\n` +
+        `*Name:* ${name}\n` +
+        `*Severity:* ${severity}\n` +
+        `*Type:* ${type}\n` +
+        `*Reported by:* @${user}\n` +
+        `*Description:* ${description}` +
+        (fileNote ? `\n*Attachments:* ${fileNote}` : ``) +
+        `\n\n_Initiating call escalation..._`
+    );
 
     // Kreni od nivoa 0 (Tier 1). Namerno BEZ await — poziv i eskalacija
     // traju minutima, a HTTP odgovor je već poslat.
