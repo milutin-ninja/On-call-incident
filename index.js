@@ -1075,6 +1075,16 @@ app.post("/slack/command", async (req, res) => {
             // ⚠️ file_input zahteva `files:read` scope na Slack app-u.
             //    `optional: true` znači da klijent može da submituje bez fajla.
             //    Limit je 100 MB po fajlu (Slack ograničenje).
+            //
+            // ⚠️ NAMERNO BEZ `filetypes`. Ne dodavaj ga!
+            //    Slack prihvata samo tačno određene stringove za tipove fajlova
+            //    i odbija CEO modal sa "invalid_arguments" ako ijedan nije na
+            //    njegovoj listi (greška: "unsupported filetype provided").
+            //    Rezultat: forma se klijentu NE OTVORI, i to upravo u trenutku
+            //    incidenta. Cena filtriranja je previsoka — bez `filetypes`
+            //    Slack prihvata sve, a fajl se ionako prilaže tasku kakav je.
+            //    Ako ti filtriranje ipak zatreba, prvo proveri svaki string
+            //    protiv Slack liste tipova pa testiraj otvaranje modala.
             {
               type: "input",
               block_id: "video_block",
@@ -1083,7 +1093,6 @@ app.post("/slack/command", async (req, res) => {
               element: {
                 type: "file_input",
                 action_id: "video_action",
-                filetypes: ["mp4", "mov", "webm", "avi", "mkv", "m4v"],
                 max_files: 1,
               },
             },
@@ -1095,8 +1104,7 @@ app.post("/slack/command", async (req, res) => {
               element: {
                 type: "file_input",
                 action_id: "shots_action",
-                filetypes: ["png", "jpg", "jpeg", "gif", "webp", "heic"],
-                // Više screenshotova je podržano — podigni broj ako treba.
+                // Više screenshotova je podržano — 10 je Slack maksimum.
                 max_files: 10,
               },
             },
