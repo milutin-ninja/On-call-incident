@@ -89,12 +89,17 @@ const CLICKUP_API_KEY = process.env.CLICKUP_API_KEY;
 //  incidentu, tako da izmena telefona u ClickUp-u odmah radi — BEZ redeploya.
 //
 //  Kako naći ove ID-jeve: otvori dokument u ClickUp-u i pogledaj URL:
-//    .../docs/<CLICKUP_PHONE_DOC_ID>/<CLICKUP_PHONE_PAGE_ID>
+//    .../v/dc/<CLICKUP_PHONE_DOC_ID>/<CLICKUP_PHONE_PAGE_ID>
+//  (stariji oblik URL-a je .../docs/<DOC_ID>/<PAGE_ID> — isti redosled)
 //  Ako neko napravi NOVI dokument umesto da edituje postojeći, ove dve
 //  vrednosti moraju da se promene ovde i da se odradi redeploy.
+//
+//  ⚠️ Ako su ID-jevi pogrešni, ClickUp vraća 403 (ne 404!) i u logu se vidi
+//     "❌ Error reading Phone Directory: Request failed with status code 403".
+//     Posledica je da NIKO nema telefon i nijedan poziv ne krene.
 // -----------------------------------------------------------------------------
-const CLICKUP_PHONE_DOC_ID = "8cn80zu-52054";
-const CLICKUP_PHONE_PAGE_ID = "8cn80zu-65534";
+const CLICKUP_PHONE_DOC_ID = "8cn80zu-62254";
+const CLICKUP_PHONE_PAGE_ID = "8cn80zu-86614";
 
 // -----------------------------------------------------------------------------
 //  RUČNO (C) — TEAM LEADS (Tier 2 eskalacije)
@@ -327,10 +332,15 @@ async function getPhoneDirectory() {
 
     console.log("📋 Phone Directory loaded:", phoneMap);
     console.log("📋 Folder Map loaded:", folderMap);
-    return { phoneMap, folderMap, nameMap };
+    return { phoneMap, folderMap, nameMap, error: null };
   } catch (err) {
-    console.error("❌ Error reading Phone Directory:", err.message);
-    return { phoneMap: {}, folderMap: {}, nameMap: {} };
+    // ⚠️ Ovo je KATASTROFALAN slučaj: bez dokumenta nema ni jednog telefona,
+    //    pa nijedan poziv ne krene. Najčešći uzrok su pogrešni doc/page ID
+    //    (ClickUp tada vraća 403). Greška se vraća pozivaocu da bi Slack
+    //    poruka mogla da kaže PRAVI uzrok, a ne "niko nema telefon".
+    const reason = `${err.response?.status || ""} ${err.message}`.trim();
+    console.error("❌ Error reading Phone Directory:", reason);
+    return { phoneMap: {}, folderMap: {}, nameMap: {}, error: reason };
   }
 }
 
@@ -640,7 +650,7 @@ async function buildEscalationChain(channelId) {
 
   // Čita se pri SVAKOM incidentu (namerno) — promena telefona u ClickUp
   // dokumentu odmah stupa na snagu, bez redeploya.
-  const { phoneMap, folderMap, nameMap } = await getPhoneDirectory();
+  const { phoneMap, folderMap, nameMap, error: directoryError } = await getPhoneDirectory();
 
   // Svi developeri upisani na ovaj folder (može ih biti 2+).
   const developers = folderMap[folderId] || [];
@@ -701,7 +711,7 @@ async function buildEscalationChain(channelId) {
   // Ovaj log je "zlatni" za debug — pokazuje tačno koga će sistem zvati i
   // ko nema telefon (phone: null).
   console.log("✅ Final escalation chain:", JSON.stringify(chain));
-  return { chain, folderId, listId };
+  return { chain, folderId, listId, directoryError };
 }
 
 // -----------------------------------------------------------------------------
@@ -805,10 +815,19 @@ function scheduleNextRound(incidentId) {
     console.error(
       `❌ Incident ${incidentId}: NOBODY in the escalation chain has a phone number — stopping retries!`
     );
+
+    // Razlikuj DVA različita uzroka, jer se različito rešavaju:
+    //   a) dokument se nije mogao pročitati (403 = pogrešan doc/page ID)
+    //   b) dokument je pročitan, ali su kolone telefona prazne
+    const cause = incident.directoryError
+      ? `The Phone Directory document could NOT be read (${incident.directoryError}). ` +
+        `Most likely the document ID in the code is wrong or access was revoked.`
+      : `The Phone Directory document was read, but no one in the chain has a phone number.`;
+
     postToSlack(
       incident.channel,
       `🆘 *Incident ${incidentId} — NOBODY WAS CALLED*\n` +
-        `No one in the escalation chain has a phone number in the Phone Directory document.\n` +
+        `${cause}\n` +
         `Retries have been stopped. *Please respond manually.*`
     );
     return;
@@ -1272,6 +1291,9 @@ app.post("/slack/interactions", async (req, res) => {
       // Brojač krugova poziva (vidi scheduleNextRound). Prvi krug = 1.
       round: 1,
       escalationChain: result?.chain || null,
+      // Ako Phone Directory nije mogao da se pročita, tu je razlog — koristi
+      // se da Slack poruka prijavi PRAVI uzrok (vidi scheduleNextRound).
+      directoryError: result?.directoryError || null,
       // Razrešena ClickUp lista (po folderu projekta). Poslednji fallback je
       // env CLICKUP_DEFAULT_LIST_ID — ako je i to prazno, task se ne pravi.
       listId: result?.listId || process.env.CLICKUP_DEFAULT_LIST_ID || null,
