@@ -67,7 +67,11 @@ app.use(bodyParser.json());
 //                      Potrebni scope-ovi: chat:write, commands.
 //  TWILIO_ACCOUNT_SID  Twilio Console -> Account Info.
 //  TWILIO_AUTH_TOKEN   Twilio Console -> Account Info.
-//  TWILIO_FROM_NUMBER  Twilio broj sa kog se zove, u E.164 formatu (+381...).
+//  TWILIO_FROM_NUMBER  Twilio broj sa kog se zove, u E.164 formatu (+1978...).
+//                      ⚠️ MORA biti broj koji POSEDUJEŠ u Twilio-u (Phone
+//                      Numbers -> Active numbers). Tuđ ili istekao broj daje
+//                      grešku "source phone number ... is not yet verified".
+//                      Razmaci su OK — kod ih sam skida.
 //  RAILWAY_URL         Javni URL ovog servisa, BEZ kose crte na kraju.
 //                      ⚠️ Twilio sa ovog URL-a čita instrukcije za poziv —
 //                      ako je pogrešan, pozivi zvone ali niko ne čuje poruku.
@@ -77,9 +81,23 @@ app.use(bodyParser.json());
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
+// Broj SA KOG se zove. Provlači se kroz normalizePhone da razmaci u Railway
+// varijabli (npr. "+1 978 845 8315") ne obore svaki poziv.
+// (normalizePhone je function declaration pa je hoistovan — dostupan je ovde.)
+const TWILIO_FROM_NUMBER = normalizePhone(process.env.TWILIO_FROM_NUMBER);
 const RAILWAY_URL = process.env.RAILWAY_URL;
 const CLICKUP_API_KEY = process.env.CLICKUP_API_KEY;
+
+// Provera pri startu: ako FROM broj nije važeći, NIJEDAN poziv ne može da
+// prođe. Bolje da se to vidi u logu odmah nego tek na prvi incident.
+if (!TWILIO_FROM_NUMBER) {
+  console.error(
+    "❌ STARTUP: TWILIO_FROM_NUMBER is missing or invalid — no calls will work! " +
+      `Got: "${process.env.TWILIO_FROM_NUMBER}". It must be an E.164 number you own in Twilio (e.g. +19788458315).`
+  );
+} else {
+  console.log(`☎️ Twilio FROM number: ${TWILIO_FROM_NUMBER}`);
+}
 
 // -----------------------------------------------------------------------------
 //  RUČNO (B) — lokacija "Phone Directory" dokumenta u ClickUp-u
@@ -295,7 +313,10 @@ async function getPhoneDirectory() {
       // Kolona sa folderima je opciona — osoba bez foldera je i dalje
       // dostupna kao team lead / CTO preko phoneMap, samo nije Tier 1.
       const folderIds = cells[3] ? cells[3].split(",").map(id => id.trim()).filter(Boolean) : [];
-      // Iz @mention-a ClickUp vraća oblik "user_mention#42457090".
+      // ClickUp @mention u markdown-u izlazi kao MARKDOWN LINK:
+      //   [@Milutin Djokic](#user_mention#88462346)
+      // Regex hvata samo "user_mention#<broj>" deo, pa radi bez obzira na
+      // ime u linku. (Potvrđeno na produkciji.)
       const match = profileCell.match(/user_mention#(\d+)/);
 
       if (!match) {
@@ -836,6 +857,25 @@ function scheduleNextRound(incidentId) {
   const maxRounds = parseInt(process.env.INCIDENT_MAX_ROUNDS || "0", 10);
   const pauseMs = parseInt(process.env.INCIDENT_ROUND_PAUSE_MS || "300000", 10);
 
+  // ⚠️ Ako NIJEDAN poziv nije ni krenuo jer ga je Twilio odbio, ponavljanje je
+  //    besmisleno — to je greška u PODEŠAVANJU (npr. neverifikovan
+  //    TWILIO_FROM_NUMBER, potrošen kredit), a ne "niko se ne javlja".
+  //    Bez ove provere Slack bi lagao: "N rounds without acknowledgement",
+  //    dok telefon uopšte nije zazvonio.
+  if (!incident.callsPlaced && incident.lastTwilioError) {
+    console.error(
+      `❌ Incident ${incidentId}: no call was ever placed — Twilio rejected every attempt. Stopping retries.`
+    );
+    postToSlack(
+      incident.channel,
+      `🆘 *Incident ${incidentId} — CALLS COULD NOT BE PLACED*\n` +
+        `Twilio rejected every call attempt, so no phone ever rang.\n` +
+        `Reason: _${incident.lastTwilioError}_\n` +
+        `This is a Twilio configuration problem. *Please respond manually.*`
+    );
+    return;
+  }
+
   incident.round = (incident.round || 1) + 1;
 
   // maxRounds = 0 znači neograničeno, pa se ovaj uslov nikad ne aktivira.
@@ -921,6 +961,9 @@ async function escalateCall(incidentId, tierIndex = 0) {
     });
 
     console.log(`✅ Call initiated for ${tierName}: ${call.sid}`);
+    // Brojač stvarno UPUĆENIH poziva. Koristi se da se razlikuje "niko se ne
+    // javlja" od "nijedan poziv nije ni krenuo" (vidi scheduleNextRound).
+    incident.callsPlaced = (incident.callsPlaced || 0) + 1;
     activeIncidents[incidentId].callSid = call.sid;
     activeIncidents[incidentId].currentTier = tierIndex;
 
@@ -939,8 +982,12 @@ async function escalateCall(incidentId, tierIndex = 0) {
     }, 120000);
 
   } catch (err) {
-    // Npr. nevažeći broj, nepokriven region, potrošen Twilio kredit.
+    // Npr. neverifikovan/nekupljen TWILIO_FROM_NUMBER, nevažeći broj,
+    // nepokriven region, potrošen Twilio kredit.
     console.error(`❌ Twilio error for ${tierName}:`, err.message);
+    // Zapamti razlog — ako ni jedan poziv u krugu ne prođe, Slack poruka
+    // treba da kaže OVO, a ne "niko se nije javio".
+    incident.lastTwilioError = err.message;
     escalateCall(incidentId, tierIndex + 1);
   }
 }
