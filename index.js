@@ -357,16 +357,6 @@ function resolveListId(lists, folderId) {
 }
 
 // -----------------------------------------------------------------------------
-//  PRIORITY_MAP — severity iz Slack forme -> ClickUp priority
-// -----------------------------------------------------------------------------
-//  ClickUp priority skala: 1 = Urgent, 2 = High, 3 = Normal, 4 = Low.
-//  ⚠️ Ključevi ("P1","P2","P3") MORAJU da odgovaraju `value` poljima u Slack
-//     modalu (vidi /slack/command). Ako tamo dodaš npr. "P4", dodaj ga i ovde,
-//     inače tiho pada na 3 (Normal).
-// -----------------------------------------------------------------------------
-const PRIORITY_MAP = { P1: 1, P2: 2, P3: 3 };
-
-// -----------------------------------------------------------------------------
 //  FAJLOVI IZ SLACK FORME (video zapis + screenshotovi)
 // -----------------------------------------------------------------------------
 //  ⚠️ ZAŠTO OVO NIJE SAMO LINK U OPISU:
@@ -1022,21 +1012,6 @@ app.post("/twilio/status", (req, res) => {
 // -----------------------------------------------------------------------------
 //  Slack zahteva odgovor u roku od 3 sekunde, zato se prvo pošalje 200
 //  (res.status(200).send()) a modal se otvara posle, preko views.open.
-//
-//  ⚠️ RUČNO — OPCIJE U FORMI SU HARDKODOVANE OVDE:
-//     - Severity: P1 / P2 / P3
-//       `value` mora da postoji u PRIORITY_MAP (gore), inače ClickUp
-//       priority tiho padne na Normal.
-//     - Incident Type: Layout / JS / Forms
-//       Slobodno se dodaju nove opcije, nigde drugo se ne proverava —
-//       vrednost se samo prepisuje u ime i opis taska.
-//
-//  ⚠️ private_metadata: channel_id — OVAKO se pamti iz kog je kanala forma
-//     pokrenuta. To je jedini način da posle znamo koji je projekat
-//     (Slack ne šalje kanal u view_submission payloadu). NE dirati.
-// -----------------------------------------------------------------------------
-app.post("/slack/command", async (req, res) => {
-  const { trigger_id, channel_id } = req.body;
   // Prvi log koji mora da se pojavi kad se ukuca /incident. Ako ovoga NEMA
   // u Railway logu, Slack ne stiže do servera (pogrešan Request URL u Slack
   // app konfiguraciji, ili servis ne radi).
