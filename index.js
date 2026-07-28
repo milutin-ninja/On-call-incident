@@ -4,7 +4,8 @@
 //
 //  ŠTA OVO RADI (ukratko):
 //  1. Klijent u svom Slack kanalu pokrene slash komandu -> otvori se modal
-//     forma (severity / type / description).            [POST /slack/command]
+//     forma (incident name / description / video / screenshots).
+//                                                       [POST /slack/command]
 //  2. Na submit forme: Slack kanal se preslika u ClickUp FOLDER (projekat),
 //     iz foldera se izgradi "escalation chain" i krene zvonjava.
 //                                                  [POST /slack/interactions]
@@ -357,6 +358,22 @@ function resolveListId(lists, folderId) {
 }
 
 // -----------------------------------------------------------------------------
+//  INCIDENT_PRIORITY — ClickUp priority za SVE incidente
+// -----------------------------------------------------------------------------
+//  Polje "Severity" je izbačeno iz forme, pa nema više po čemu da se priority
+//  razlikuje od incidenta do incidenta. Svaki incident dobija istu vrednost.
+//
+//  ClickUp priority skala: 1 = Urgent, 2 = High, 3 = Normal, 4 = Low.
+//  Postavljeno na 1 (Urgent) jer je po definiciji reč o incidentu koji je
+//  digao ljude telefonom — tako taskovi vizuelno iskaču u ClickUp listi.
+//
+//  Ako želiš drugu vrednost, promeni SAMO ovaj broj (npr. 2 za High).
+//  Ako ne želiš da se priority uopšte postavlja, stavi null — tada se polje
+//  ne šalje i ClickUp koristi svoj default.
+// -----------------------------------------------------------------------------
+const INCIDENT_PRIORITY = 1;
+
+// -----------------------------------------------------------------------------
 //  FAJLOVI IZ SLACK FORME (video zapis + screenshotovi)
 // -----------------------------------------------------------------------------
 //  ⚠️ ZAŠTO OVO NIJE SAMO LINK U OPISU:
@@ -437,14 +454,10 @@ async function createClickUpTask(incident, person) {
     throw new Error(`No ClickUp list resolved for incident ${incident.id} (folder ${incident.folderId})`);
   }
 
-  const priority = PRIORITY_MAP[incident.severity] || 3;
-
   // Opis taska. `markdown_description` (ne `description`) je ClickUp polje
   // koje renderuje markdown — zato **bold** radi.
   const lines = [
     `**Incident ID:** ${incident.id}`,
-    `**Severity:** ${incident.severity}`,
-    `**Type:** ${incident.type}`,
     `**Reported by (Slack):** ${incident.user}`,
     `**Acknowledged by:** ${person?.name || "N/A"}`,
     `**Created:** ${incident.createdAt}`,
@@ -479,10 +492,14 @@ async function createClickUpTask(incident, person) {
   const body = {
     // Ime taska = "Incident name" koje je klijent uneo u formu.
     // Fallback postoji samo za slučaj da polje nekako dođe prazno.
-    name: incident.name || `[${incident.severity}] ${incident.type} — ${incident.id}`,
+    name: incident.name || `Incident ${incident.id}`,
     markdown_description,
-    priority,
   };
+
+  // Priority se šalje samo ako je INCIDENT_PRIORITY postavljen (nije null).
+  if (INCIDENT_PRIORITY !== null) {
+    body.priority = INCIDENT_PRIORITY;
+  }
 
   // ⚠️ ClickUp očekuje assignees kao niz BROJEVA, a user ID-jevi se kroz
   //    ceo ovaj fajl vuku kao stringovi (iz regexa / TEAM_LEADS) — zato Number().
@@ -877,12 +894,10 @@ app.all("/twilio/voice", (req, res) => {
 
   // Fallback vrednosti postoje da poziv ne bi pukao ako je incident izgubljen
   // iz memorije (restart) — čovek će čuti "Unknown" umesto tišine.
-  const severity = incident?.severity || "Unknown";
-  const type = incident?.type || "Unknown";
   const description = incident?.description || "No description";
   const name = incident?.name || "Unnamed incident";
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Gather numDigits="1" action="${RAILWAY_URL}/twilio/gather?incidentId=${incidentId}&amp;tier=${tier}" method="POST" timeout="10"><Say voice="alice" language="en-US">Alert. New incident reported. ${name}. Severity ${severity}. Type ${type}. Description ${description}. This is ${tierName} escalation. Press 1 to acknowledge and take ownership of this incident.</Say></Gather><Say voice="alice">No input received. Escalating to next tier.</Say></Response>`;
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Gather numDigits="1" action="${RAILWAY_URL}/twilio/gather?incidentId=${incidentId}&amp;tier=${tier}" method="POST" timeout="10"><Say voice="alice" language="en-US">Alert. New incident reported. ${name}. Description ${description}. This is ${tierName} escalation. Press 1 to acknowledge and take ownership of this incident.</Say></Gather><Say voice="alice">No input received. Escalating to next tier.</Say></Response>`;
 
   res.type("text/xml");
   res.send(twiml);
@@ -1012,6 +1027,21 @@ app.post("/twilio/status", (req, res) => {
 // -----------------------------------------------------------------------------
 //  Slack zahteva odgovor u roku od 3 sekunde, zato se prvo pošalje 200
 //  (res.status(200).send()) a modal se otvara posle, preko views.open.
+//
+//  ⚠️ RUČNO — OPCIJE U FORMI SU HARDKODOVANE OVDE:
+//     - Severity: P1 / P2 / P3
+//       `value` mora da postoji u PRIORITY_MAP (gore), inače ClickUp
+//       priority tiho padne na Normal.
+//     - Incident Type: Layout / JS / Forms
+//       Slobodno se dodaju nove opcije, nigde drugo se ne proverava —
+//       vrednost se samo prepisuje u ime i opis taska.
+//
+//  ⚠️ private_metadata: channel_id — OVAKO se pamti iz kog je kanala forma
+//     pokrenuta. To je jedini način da posle znamo koji je projekat
+//     (Slack ne šalje kanal u view_submission payloadu). NE dirati.
+// -----------------------------------------------------------------------------
+app.post("/slack/command", async (req, res) => {
+  const { trigger_id, channel_id } = req.body;
   // Prvi log koji mora da se pojavi kad se ukuca /incident. Ako ovoga NEMA
   // u Railway logu, Slack ne stiže do servera (pogrešan Request URL u Slack
   // app konfiguraciji, ili servis ne radi).
@@ -1035,8 +1065,8 @@ app.post("/twilio/status", (req, res) => {
           close: { type: "plain_text", text: "Cancel" },
           blocks: [
             // ⚠️ block_id i action_id se čitaju u /slack/interactions
-            //    (values.severity_block.severity_action...). Ako ih
-            //    preimenuješ ovde, MORAŠ i tamo — inače submit pukne.
+            //    (values.name_block.name_action...). Ako ih preimenuješ
+            //    ovde, MORAŠ i tamo — inače submit pukne.
 
             // Ime incidenta -> postaje IME TASKA u ClickUp-u.
             {
@@ -1050,34 +1080,6 @@ app.post("/twilio/status", (req, res) => {
                   type: "plain_text",
                   text: "e.g. Contact form is not submitting data",
                 },
-              },
-            },
-            {
-              type: "input",
-              block_id: "severity_block",
-              label: { type: "plain_text", text: "Severity" },
-              element: {
-                type: "static_select",
-                action_id: "severity_action",
-                options: [
-                  { text: { type: "plain_text", text: "P1 - Critical" }, value: "P1" },
-                  { text: { type: "plain_text", text: "P2 - High" }, value: "P2" },
-                  { text: { type: "plain_text", text: "P3 - Medium" }, value: "P3" },
-                ],
-              },
-            },
-            {
-              type: "input",
-              block_id: "type_block",
-              label: { type: "plain_text", text: "Incident Type" },
-              element: {
-                type: "static_select",
-                action_id: "type_action",
-                options: [
-                  { text: { type: "plain_text", text: "Layout" }, value: "Layout" },
-                  { text: { type: "plain_text", text: "JS" }, value: "JS" },
-                  { text: { type: "plain_text", text: "Forms" }, value: "Forms" },
-                ],
               },
             },
             {
@@ -1177,8 +1179,6 @@ app.post("/slack/interactions", async (req, res) => {
     //    /slack/command modala.
     const values = payload.view.state.values;
     const name = values.name_block.name_action.value;
-    const severity = values.severity_block.severity_action.selected_option.value;
-    const type = values.type_block.type_action.selected_option.value;
     const description = values.desc_block.desc_action.value;
     // file_input vraća niz Slack file objekata u `.files`. Polja su opciona,
     // pa kad klijent ne uploaduje ništa dobijamo prazan niz (ili undefined).
@@ -1202,8 +1202,6 @@ app.post("/slack/interactions", async (req, res) => {
       id: incidentId,
       // Ime iz forme -> ime taska u ClickUp-u.
       name,
-      severity,
-      type,
       description,
       // Slack file objekti (id, name, mimetype, url_private, permalink...).
       videoFiles,
@@ -1239,8 +1237,6 @@ app.post("/slack/interactions", async (req, res) => {
       channel,
       `🚨 *New Incident — ${incidentId}*\n` +
         `*Name:* ${name}\n` +
-        `*Severity:* ${severity}\n` +
-        `*Type:* ${type}\n` +
         `*Reported by:* @${user}\n` +
         `*Description:* ${description}` +
         (fileNote ? `\n*Attachments:* ${fileNote}` : ``) +
