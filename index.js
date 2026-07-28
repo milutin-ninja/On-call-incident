@@ -27,7 +27,7 @@
 // -----------------------------------------------------------------------------
 //  ⚠️  ŠTA SE ODRŽAVA RUČNO — pročitaj ovo pre nego što diraš bilo šta
 // -----------------------------------------------------------------------------
-//  Postoje 4 mesta koja se ručno ažuriraju kad se doda klijent ili se promeni
+//  Postoje 3 mesta koja se ručno ažuriraju kad se doda klijent ili se promeni
 //  tim. Detaljna uputstva su u komentarima na samim mestima u kodu:
 //
 //  (A) Railway env varijabla po klijentu:  SLACK_CHANNEL_<ime>_<CHANNEL_ID>
@@ -35,16 +35,17 @@
 //  (B) ClickUp "Phone Directory" dokument (telefoni + folderi po developeru)
 //      -> živi u ClickUp-u, NE u kodu.                 [vidi getPhoneDirectory]
 //  (C) TEAM_LEADS konstanta u ovom fajlu.              [vidi TEAM_LEADS]
-//  (D) Lista "Incidents" unutar svakog projektnog foldera u ClickUp-u.
-//                                                      [vidi resolveListId]
+//
+//  Task ide u PRVU listu projektnog foldera (obično "Task list") — ništa se
+//  ne podešava. Ako ikad zatreba odvojena lista, vidi resolveListId.
 //
 //  ⚠️ SLACK APP SCOPE-OVI: chat:write, commands, files:read
 //     `files:read` je OBAVEZAN — bez njega upload videa/screenshotova u
 //     formi radi, ali skidanje fajla pada i task ostane bez priloga.
 //
 //  ⚠️ OPCIONE ENV VARIJABLE (imaju razumne default vrednosti):
-//     CLICKUP_INCIDENT_LIST_NAME  ime liste u folderu (default "Incidents")
-//     CLICKUP_DEFAULT_LIST_ID     rezervna lista ako folder nema svoju
+//     CLICKUP_INCIDENT_LIST_NAME  ako želiš odvojenu listu za incidente
+//     CLICKUP_DEFAULT_LIST_ID     rezervna lista ako folder nema nijednu
 //     INCIDENT_ROUND_PAUSE_MS     pauza između krugova poziva (default 5 min)
 //     INCIDENT_MAX_ROUNDS         limit krugova (default 0 = neograničeno)
 // =============================================================================
@@ -154,6 +155,51 @@ const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const activeIncidents = {};
 
 // -----------------------------------------------------------------------------
+//  normalizePhone(raw)
+// -----------------------------------------------------------------------------
+//  Čisti broj telefona iz tabele u E.164 oblik koji Twilio prihvata.
+//  Skida SVE osim cifara i vodećeg "+": razmake, crtice, zagrade, tačke.
+//    "+381 61 647-9594"  -> "+381616479594"
+//    "(+381) 61 6479594" -> "+381616479594"
+//    "00381616479594"    -> "+381616479594"  (00 prefiks -> +)
+//
+//  Zašto: neko će pre ili kasnije ukucati broj sa razmacima, a Twilio takav
+//  broj odbija. Bolje da kod to sam popravi nego da incident propadne zbog
+//  jednog razmaka.
+//
+//  Vraća null za prazan/nevažeći unos, da se taj nivo eskalacije preskoči.
+// -----------------------------------------------------------------------------
+function normalizePhone(raw) {
+  if (!raw) return null;
+
+  // Zadrži samo cifre i "+", pa ukloni sve "+" koji nisu na prvom mestu.
+  let cleaned = String(raw).replace(/[^\d+]/g, "");
+  cleaned = cleaned.replace(/(?!^)\+/g, "");
+
+  // Međunarodni "00" prefiks je isto što i "+".
+  if (cleaned.startsWith("00")) {
+    cleaned = "+" + cleaned.slice(2);
+  }
+
+  // Prekratko da bude pravi broj.
+  if (cleaned.replace("+", "").length < 6) {
+    console.warn(`⚠️ Phone number looks invalid, ignoring: "${raw}"`);
+    return null;
+  }
+
+  // Twilio zahteva E.164 (sa pozivnim brojem zemlje). Bez "+" poziv pada,
+  // pa je bolje glasno prijaviti nego tiho pokušati.
+  if (!cleaned.startsWith("+")) {
+    console.warn(
+      `⚠️ Phone number "${raw}" has no country code (must start with + or 00) — ignoring.`
+    );
+    return null;
+  }
+
+  return cleaned;
+}
+
+// -----------------------------------------------------------------------------
 //  getPhoneDirectory()
 // -----------------------------------------------------------------------------
 //  Čita ClickUp dokument "Phone Directory" i parsira ga kao markdown tabelu.
@@ -238,7 +284,9 @@ async function getPhoneDirectory() {
 
       const profileCell = cells[0];
       const fullName = cells[1];
-      const phone = cells[2];
+      // Broj se odmah normalizuje (razmaci/crtice/zagrade se skidaju), da se
+      // dalje kroz kod vuče isključivo čist E.164 oblik.
+      const phone = normalizePhone(cells[2]);
       // Kolona sa folderima je opciona — osoba bez foldera je i dalje
       // dostupna kao team lead / CTO preko phoneMap, samo nije Tier 1.
       const folderIds = cells[3] ? cells[3].split(",").map(id => id.trim()).filter(Boolean) : [];
@@ -314,40 +362,51 @@ async function getFolderInfo(folderId) {
 // -----------------------------------------------------------------------------
 //  resolveListId(lists, folderId)
 // -----------------------------------------------------------------------------
-//  ⚠️ RUČNO (D) — ODLUČUJE U KOJU CLICKUP LISTU IDE TASK.
+//  ODLUČUJE U KOJU CLICKUP LISTU IDE TASK.
 //
-//  Konvencija: svaki projektni folder treba da ima listu pod imenom
-//  "Incidents". Tako ne mora da se održava mapiranje po projektu — samo
-//  napraviš listu sa tim imenom u ClickUp-u i radi.
+//  DEFAULT PONAŠANJE (bez ikakvog podešavanja): task ide u PRVU listu u
+//  projektnom folderu — to je obično "Task list", tj. normalna lista projekta.
+//  Znači: NE moraš da praviš posebnu listu po folderu, radi samo tako.
 //
-//  Redosled odlučivanja (fallback lanac):
-//    1. lista u folderu čije ime je == CLICKUP_INCIDENT_LIST_NAME
-//       (env varijabla, default "Incidents"; poredi se case-insensitive)
-//    2. ako te liste nema -> PRVA lista u folderu (loguje ⚠️ warning)
-//    3. ako folder nema nijednu listu -> env CLICKUP_DEFAULT_LIST_ID
-//    4. ako ni to nije postavljeno -> null, task se NE pravi
-//       (createClickUpTask baca jasnu grešku)
+//  Ako ti ikad zatreba da incidenti idu u ODVOJENU listu, postavi env
+//  varijablu CLICKUP_INCIDENT_LIST_NAME (npr. "Incidents") i napravi listu sa
+//  tim imenom u svakom projektnom folderu. Tek tada se lista traži po imenu.
 //
-//  ⚠️ Korak 2 je namerno "tih" fallback da incident nikad ne propadne zbog
-//     administracije, ALI znači da task može da završi u pogrešnoj listi.
-//     Zato posle dodavanja klijenta proveri log liniju:
-//       📁 Folder <id>: koristim listu "Incidents" (<listId>)
-//     Ako vidiš ⚠️ umesto 📁 — nedostaje "Incidents" lista u tom folderu.
+//  Redosled odlučivanja:
+//    1. AKO je CLICKUP_INCIDENT_LIST_NAME postavljen -> traži listu sa tim
+//       imenom (case-insensitive). Ako je nema, ⚠️ warning i ide korak 2.
+//    2. PRVA lista u folderu (normalno ponašanje, bez warninga).
+//    3. Ako folder nema nijednu listu -> env CLICKUP_DEFAULT_LIST_ID.
+//    4. Ako ni to nije postavljeno -> null, task se NE pravi
+//       (createClickUpTask baca jasnu grešku).
 //
-//  Preporuka: postavi CLICKUP_DEFAULT_LIST_ID na neku "Incidents – Uncategorized"
-//  listu, da task uvek ima gde da padne i ništa se ne izgubi.
+//  U logu proveri liniju:
+//    📁 Folder <id>: using list "<ime>" (<listId>)
+//  Tako uvek znaš gde je task otišao.
 // -----------------------------------------------------------------------------
 function resolveListId(lists, folderId) {
-  const wanted = (process.env.CLICKUP_INCIDENT_LIST_NAME || "Incidents").toLowerCase();
+  // Namerno BEZ default vrednosti — ako varijabla nije postavljena, ne traži
+  // se nikakvo posebno ime i ide se pravo na prvu listu u folderu.
+  const wanted = (process.env.CLICKUP_INCIDENT_LIST_NAME || "").trim().toLowerCase();
 
   if (lists.length > 0) {
-    const named = lists.find(l => (l.name || "").toLowerCase() === wanted);
-    if (named) {
-      console.log(`📁 Folder ${folderId}: using list "${named.name}" (${named.id})`);
-      return named.id;
+    if (wanted) {
+      const named = lists.find(l => (l.name || "").toLowerCase() === wanted);
+      if (named) {
+        console.log(`📁 Folder ${folderId}: using list "${named.name}" (${named.id})`);
+        return named.id;
+      }
+      // Traženo ime je eksplicitno podešeno ali lista ne postoji — to je
+      // stvarna greška u podešavanju, pa zaslužuje warning.
+      console.warn(
+        `⚠️ Folder ${folderId}: no list named "${wanted}", falling back to first list "${lists[0].name}" (${lists[0].id})`
+      );
+      return lists[0].id;
     }
-    console.warn(
-      `⚠️ Folder ${folderId}: no list named "${wanted}", falling back to first list "${lists[0].name}" (${lists[0].id})`
+
+    // Default put: prva lista u folderu. Ovo je normalno, ne greška.
+    console.log(
+      `📁 Folder ${folderId}: using first list "${lists[0].name}" (${lists[0].id})`
     );
     return lists[0].id;
   }
@@ -545,8 +604,8 @@ async function createClickUpTask(incident, person) {
 //  KAKO DODATI NOVOG KLIJENTA (3 koraka):
 //    1. U Slacku: uzmi Channel ID (Channel details -> dole "Channel ID",
 //       oblik C0ABC123DEF).
-//    2. U ClickUp-u: uzmi Folder ID projekta (otvori folder, ID je u URL-u)
-//       i napravi u njemu listu "Incidents".
+//    2. U ClickUp-u: uzmi Folder ID projekta (otvori folder, ID je u URL-u).
+//       Ne treba praviti nikakvu novu listu — task ide u prvu listu foldera.
 //    3. U Railway-u: dodaj varijablu SLACK_CHANNEL_<ime>_<CHANNEL_ID> sa
 //       vrednošću Folder ID. Railway se sam redeployuje.
 //    + Ne zaboravi developera: njegov red u Phone Directory dokumentu mora
