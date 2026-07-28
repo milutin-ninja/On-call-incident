@@ -993,10 +993,16 @@ app.post("/twilio/status", (req, res) => {
 // -----------------------------------------------------------------------------
 app.post("/slack/command", async (req, res) => {
   const { trigger_id, channel_id } = req.body;
+  // Prvi log koji mora da se pojavi kad se ukuca /incident. Ako ovoga NEMA
+  // u Railway logu, Slack ne stiže do servera (pogrešan Request URL u Slack
+  // app konfiguraciji, ili servis ne radi).
+  console.log(
+    `⚡ /incident pozvan | kanal: ${channel_id} | trigger_id: ${trigger_id ? "ok" : "FALI"}`
+  );
   res.status(200).send();
 
   try {
-    await axios.post(
+    const response = await axios.post(
       "https://slack.com/api/views.open",
       {
         // trigger_id važi samo ~3 sekunde od komande.
@@ -1104,6 +1110,20 @@ app.post("/slack/command", async (req, res) => {
         },
       }
     );
+
+    // ⚠️ views.open na grešku vraća HTTP 200 sa { ok: false, error, ... }.
+    //    axios to NE tretira kao grešku, pa catch ispod NIKAD ne bi opalio i
+    //    modal bi se "tiho" ne otvarao. Zato se `ok` proverava ručno.
+    //    response_metadata.messages sadrži tačan opis šta u blokovima ne štima.
+    if (!response.data?.ok) {
+      console.error("❌ views.open odbijen:", response.data?.error);
+      console.error(
+        "❌ detalji:",
+        JSON.stringify(response.data?.response_metadata || {})
+      );
+    } else {
+      console.log("✅ Modal otvoren");
+    }
   } catch (err) {
     // Najčešće: istekao trigger_id ili token bez scope-a.
     console.error("Error opening modal:", err.response?.data || err.message);
