@@ -201,37 +201,81 @@ async function getPhoneDirectory() {
     const folderMap = {};
     const nameMap = {};
 
+    // Dijagnostika: prvih 600 karaktera sirovog sadržaja dokumenta. Ovo je
+    // najbrži način da se vidi da li ClickUp uopšte vraća tabelu i u kom
+    // obliku vraća @mention (od toga zavisi regex ispod).
+    console.log(
+      "📄 Phone Directory raw content (first 600 chars):\n" +
+        String(content || "").slice(0, 600)
+    );
+
     // Zadrži samo redove tabele: počinju sa "|", nisu separator "---",
     // i nisu zaglavlje (prepoznaje se po reči "Profil").
-    const rows = content.split("\n").filter(row => row.startsWith("|") && !row.includes("---") && !row.includes("Profil"));
+    const rows = content.split("\n").filter(row => row.trim().startsWith("|") && !row.includes("---") && !row.includes("Profil"));
+    console.log(`📄 Table rows found: ${rows.length}`);
+
     for (const row of rows) {
-      // filter(Boolean) izbacuje prazne stringove koji nastaju od vodećeg
-      // i završnog "|" u markdown redu.
-      const cells = row.split("|").map(c => c.trim()).filter(Boolean);
-      if (cells.length >= 3) {
-        const profileCell = cells[0];
-        const fullName = cells[1];
-        const phone = cells[2];
-        // Kolona sa folderima je opciona — osoba bez foldera je i dalje
-        // dostupna kao team lead / CTO preko phoneMap, samo nije Tier 1.
-        const folderIds = cells[3] ? cells[3].split(",").map(id => id.trim()).filter(Boolean) : [];
-        // Iz @mention-a ClickUp vraća oblik "user_mention#42457090".
-        const match = profileCell.match(/user_mention#(\d+)/);
-        if (match) {
-          const clickupId = match[1];
-          phoneMap[clickupId] = phone;
-          nameMap[clickupId] = fullName;
-          // Jedan folder MOŽE imati više developera — svi se skupljaju u
-          // niz i svi postaju Tier 1 (redosled nije bitan, vidi
-          // buildEscalationChain). Upiši istog Folder ID kod više ljudi
-          // u Phone Directory tabeli i svi će biti zvani u prvom krugu.
-          for (const folderId of folderIds) {
-            if (!folderMap[folderId]) folderMap[folderId] = [];
-            folderMap[folderId].push({ clickupId, phone, name: fullName });
-          }
-        }
+      // ⚠️ NE koristi filter(Boolean) ovde! Prazna ćelija je legitimna
+      //    (npr. team lead bez Folder ID-ja), a filter(Boolean) je izbaci i
+      //    POMERI sve kolone ulevo — telefon bi postao Folder ID i obrnuto.
+      //    Zato se skidaju samo vodeći i završni "|", pa se deli, a prazne
+      //    ćelije unutar reda se ČUVAJU da kolone ostanu poravnate.
+      const cells = row
+        .trim()
+        .replace(/^\|/, "")
+        .replace(/\|$/, "")
+        .split("|")
+        .map(c => c.trim());
+
+      // Potpuno prazan red u tabeli (ClickUp ih drži kao rezervu) — preskoči.
+      if (cells.every(c => c === "")) continue;
+
+      if (cells.length < 3) {
+        console.warn(`⚠️ Skipped row (needs at least 3 columns): ${row.trim()}`);
+        continue;
+      }
+
+      const profileCell = cells[0];
+      const fullName = cells[1];
+      const phone = cells[2];
+      // Kolona sa folderima je opciona — osoba bez foldera je i dalje
+      // dostupna kao team lead / CTO preko phoneMap, samo nije Tier 1.
+      const folderIds = cells[3] ? cells[3].split(",").map(id => id.trim()).filter(Boolean) : [];
+      // Iz @mention-a ClickUp vraća oblik "user_mention#42457090".
+      const match = profileCell.match(/user_mention#(\d+)/);
+
+      if (!match) {
+        // Najčešći uzrok: u prvoj koloni je OBIČAN TEKST, ne pravi @mention.
+        console.warn(
+          `⚠️ Skipped row for "${fullName}": no @mention found in first column ` +
+            `(got: "${profileCell}")`
+        );
+        continue;
+      }
+
+      const clickupId = match[1];
+
+      // Telefon je OBAVEZAN za svakoga (i za team leada i za CTO-a) —
+      // bez njega se taj nivo eskalacije preskače.
+      if (!phone) {
+        console.warn(
+          `⚠️ "${fullName}" (ID ${clickupId}) has NO phone number — this person will be skipped when calling.`
+        );
+      }
+
+      phoneMap[clickupId] = phone;
+      nameMap[clickupId] = fullName;
+
+      // Jedan folder MOŽE imati više developera — svi se skupljaju u
+      // niz i svi postaju Tier 1 (redosled nije bitan, vidi
+      // buildEscalationChain). Upiši istog Folder ID kod više ljudi
+      // u Phone Directory tabeli i svi će biti zvani u prvom krugu.
+      for (const folderId of folderIds) {
+        if (!folderMap[folderId]) folderMap[folderId] = [];
+        folderMap[folderId].push({ clickupId, phone, name: fullName });
       }
     }
+
     console.log("📋 Phone Directory loaded:", phoneMap);
     console.log("📋 Folder Map loaded:", folderMap);
     return { phoneMap, folderMap, nameMap };
@@ -298,17 +342,17 @@ function resolveListId(lists, folderId) {
   if (lists.length > 0) {
     const named = lists.find(l => (l.name || "").toLowerCase() === wanted);
     if (named) {
-      console.log(`📁 Folder ${folderId}: koristim listu "${named.name}" (${named.id})`);
+      console.log(`📁 Folder ${folderId}: using list "${named.name}" (${named.id})`);
       return named.id;
     }
     console.warn(
-      `⚠️ Folder ${folderId}: nema liste "${wanted}", fallback na prvu listu "${lists[0].name}" (${lists[0].id})`
+      `⚠️ Folder ${folderId}: no list named "${wanted}", falling back to first list "${lists[0].name}" (${lists[0].id})`
     );
     return lists[0].id;
   }
 
   const fallback = process.env.CLICKUP_DEFAULT_LIST_ID || null;
-  console.warn(`⚠️ Folder ${folderId}: nema nijedne liste, fallback na CLICKUP_DEFAULT_LIST_ID=${fallback}`);
+  console.warn(`⚠️ Folder ${folderId}: has no lists at all, falling back to CLICKUP_DEFAULT_LIST_ID=${fallback}`);
   return fallback;
 }
 
@@ -437,7 +481,7 @@ async function createClickUpTask(incident, person) {
   }
 
   if (incident.videoFiles?.length > 0 || incident.screenshotFiles?.length > 0) {
-    lines.push(``, `_Fajlovi su dodati i kao prilozi na ovaj task._`);
+    lines.push(``, `_Files are also uploaded as attachments on this task._`);
   }
 
   const markdown_description = lines.join("\n");
@@ -633,7 +677,7 @@ async function postToSlack(channel, text) {
   const target = channel || process.env.INCIDENT_FALLBACK_CHANNEL;
 
   if (!target) {
-    console.error("❌ postToSlack: nepoznat kanal, poruka nije poslata:", text);
+    console.error("❌ postToSlack: unknown channel, message not sent:", text);
     return;
   }
 
@@ -651,7 +695,7 @@ async function postToSlack(channel, text) {
 
     if (!response.data?.ok) {
       console.error(
-        `❌ Slack odbio poruku za kanal ${target}:`,
+        `❌ Slack rejected message for channel ${target}:`,
         response.data?.error
       );
     }
@@ -693,13 +737,13 @@ function scheduleNextRound(incidentId) {
   // Ako niko nema broj, ponavljanje je besmisleno — prekini i javi.
   if (!chain.some(p => p.phone)) {
     console.error(
-      `❌ Incident ${incidentId}: NIKO u lancu nema telefon — prekidam ponavljanje!`
+      `❌ Incident ${incidentId}: NOBODY in the escalation chain has a phone number — stopping retries!`
     );
     postToSlack(
       incident.channel,
-      `🆘 *Incident ${incidentId} — NIKO NIJE POZVAN*\n` +
-        `Nijedna osoba u eskalacionom lancu nema broj telefona u Phone Directory dokumentu.\n` +
-        `Ponavljanje je zaustavljeno. *Reagujte ručno.*`
+      `🆘 *Incident ${incidentId} — NOBODY WAS CALLED*\n` +
+        `No one in the escalation chain has a phone number in the Phone Directory document.\n` +
+        `Retries have been stopped. *Please respond manually.*`
     );
     return;
   }
@@ -712,27 +756,27 @@ function scheduleNextRound(incidentId) {
   // maxRounds = 0 znači neograničeno, pa se ovaj uslov nikad ne aktivira.
   if (maxRounds > 0 && incident.round > maxRounds) {
     console.error(
-      `❌ Incident ${incidentId}: dostignut limit od ${maxRounds} krugova, prekidam.`
+      `❌ Incident ${incidentId}: reached the limit of ${maxRounds} rounds, stopping.`
     );
     postToSlack(
       incident.channel,
-      `🆘 *Incident ${incidentId} — NIKO SE NIJE JAVIO*\n` +
-        `Prošlo je ${maxRounds} krugova poziva bez potvrde. Ponavljanje je zaustavljeno.\n` +
-        `*Reagujte ručno.*`
+      `🆘 *Incident ${incidentId} — NO ANSWER*\n` +
+        `${maxRounds} rounds of calls completed without acknowledgement. Retries have been stopped.\n` +
+        `*Please respond manually.*`
     );
     return;
   }
 
   const pauseMin = Math.round(pauseMs / 60000);
   console.log(
-    `🔁 Incident ${incidentId}: krug ${incident.round - 1} bez potvrde. ` +
-      `Krug ${incident.round} počinje za ${pauseMs} ms.`
+    `🔁 Incident ${incidentId}: round ${incident.round - 1} ended without acknowledgement. ` +
+      `Round ${incident.round} starts in ${pauseMs} ms.`
   );
 
   postToSlack(
     incident.channel,
-    `🔁 *Incident ${incidentId} — niko se nije javio*\n` +
-      `Ponavljam pozive od početka (krug ${incident.round}) za ~${pauseMin} min.`
+    `🔁 *Incident ${incidentId} — no answer yet*\n` +
+      `Restarting calls from the top (round ${incident.round}) in ~${pauseMin} min.`
   );
 
   // Timer se pamti na incidentu da bi se otkazao na potvrdu (u /twilio/gather).
@@ -758,7 +802,7 @@ async function escalateCall(incidentId, tierIndex = 0) {
   // od početka (Tier 1). Ovo je ono "ponavljati proces ispočetka".
   if (!chain || tierIndex >= chain.length) {
     console.log(
-      `⚠️ Incident ${incidentId}: ceo lanac je pozvan bez potvrde (krug ${incident.round || 1}).`
+      `⚠️ Incident ${incidentId}: entire chain called without acknowledgement (round ${incident.round || 1}).`
     );
     scheduleNextRound(incidentId);
     return;
@@ -997,7 +1041,7 @@ app.post("/slack/command", async (req, res) => {
   // u Railway logu, Slack ne stiže do servera (pogrešan Request URL u Slack
   // app konfiguraciji, ili servis ne radi).
   console.log(
-    `⚡ /incident pozvan | kanal: ${channel_id} | trigger_id: ${trigger_id ? "ok" : "FALI"}`
+    `⚡ /incident invoked | channel: ${channel_id} | trigger_id: ${trigger_id ? "ok" : "MISSING"}`
   );
   res.status(200).send();
 
@@ -1029,7 +1073,7 @@ app.post("/slack/command", async (req, res) => {
                 action_id: "name_action",
                 placeholder: {
                   type: "plain_text",
-                  text: "npr. Kontakt forma ne šalje podatke",
+                  text: "e.g. Contact form is not submitting data",
                 },
               },
             },
@@ -1124,13 +1168,13 @@ app.post("/slack/command", async (req, res) => {
     //    modal bi se "tiho" ne otvarao. Zato se `ok` proverava ručno.
     //    response_metadata.messages sadrži tačan opis šta u blokovima ne štima.
     if (!response.data?.ok) {
-      console.error("❌ views.open odbijen:", response.data?.error);
+      console.error("❌ views.open rejected:", response.data?.error);
       console.error(
-        "❌ detalji:",
+        "❌ details:",
         JSON.stringify(response.data?.response_metadata || {})
       );
     } else {
-      console.log("✅ Modal otvoren");
+      console.log("✅ Modal opened");
     }
   } catch (err) {
     // Najčešće: istekao trigger_id ili token bez scope-a.
@@ -1211,7 +1255,7 @@ app.post("/slack/interactions", async (req, res) => {
     //    za to gledaj log.
     const fileNote = [
       videoFiles.length > 0 ? `🎥 ${videoFiles.length} video` : null,
-      screenshotFiles.length > 0 ? `🖼️ ${screenshotFiles.length} screenshot(a)` : null,
+      screenshotFiles.length > 0 ? `🖼️ ${screenshotFiles.length} screenshot(s)` : null,
     ]
       .filter(Boolean)
       .join(" · ");
